@@ -1,0 +1,71 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.yml — Shu et al. (2024) Replication
+#
+# Three pre-configured services:
+#   notebooks  →  Jupyter Lab (default, for interactive analysis)
+#   pipeline   →  headless CLI run (full replication in one command)
+#   tests      →  quick smoke-test to verify the environment is working
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Jupyter Lab ─────────────────────────────────────────────────────────────
+  notebooks:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: shu2024:latest
+    container_name: shu2024_notebooks
+    ports:
+      - "8888:8888"
+    volumes:
+      # Persist downloaded data and computed results across container restarts
+      - ./data:/home/researcher/app/data
+      - ./results:/home/researcher/app/results
+      # Mount notebooks so edits are saved on the host
+      - ./notebooks:/home/researcher/app/notebooks
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/home/researcher/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: >
+      jupyter lab
+        --ip=0.0.0.0
+        --port=8888
+        --no-browser
+        --NotebookApp.token=''
+        --NotebookApp.password=''
+        --notebook-dir=/home/researcher/app/notebooks
+
+  # ── Headless pipeline (full replication) ────────────────────────────────────
+  pipeline:
+    image: shu2024:latest
+    container_name: shu2024_pipeline
+    volumes:
+      - ./data:/home/researcher/app/data
+      - ./results:/home/researcher/app/results
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/home/researcher/app
+    profiles:
+      - pipeline          # only starts with: docker compose --profile pipeline up
+    command: python pipeline.py
+
+  # ── Smoke tests ─────────────────────────────────────────────────────────────
+  tests:
+    image: shu2024:latest
+    container_name: shu2024_tests
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/home/researcher/app
+    profiles:
+      - tests             # only starts with: docker compose --profile tests up
+    command: python -m pytest tests/ -v --tb=short
