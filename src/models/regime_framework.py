@@ -20,7 +20,7 @@ Liskov        : RegimeForecasterBase can replace RegimeForecaster.
 from __future__ import annotations
 
 import logging
-from copy import deepcopy
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -100,6 +100,8 @@ def _sharpe_01_strategy(
 
     daily_mean = strat_ret.mean()
     daily_std  = strat_ret.std()
+    if len(strat_ret) < 5 or not math.isfinite(float(daily_mean)) or not math.isfinite(float(daily_std)):
+        return float("-inf")
     if daily_std < 1e-10:
         return 0.0
     return float(daily_mean / daily_std * np.sqrt(TRADING_DAYS_YEAR))
@@ -185,7 +187,7 @@ class RegimeFramework:
         ret_feats_jm  = self._ret_feat_builder.build(
             self.excess_returns[asset], asset, for_jm=True
         )
-        X_xgb_full = ret_feats_xgb.join(macro_feats, how="left").fillna(method="ffill")
+        X_xgb_full = ret_feats_xgb.join(macro_feats, how="left").ffill()
 
         for i, rebal_date in enumerate(rebal):
             # Training window: [rebal_date - train_years, rebal_date)
@@ -210,10 +212,11 @@ class RegimeFramework:
             jm = JumpModel(jump_pen=lam)
             jm.fit(X_jm_train.values)
 
-            # Determine bullish state (higher cumulative excess return)
+            # Bullish = higher *conditional mean* excess return (not cumulative total:
+            # cumulative favours long low-drift regimes when λ is large and one state persists).
             er_train = self.excess_returns[asset].reindex(X_jm_train.index)
             stats    = jm.regime_stats(er_train.values)
-            bull_state = max(stats, key=lambda k: stats[k]["cum_return"])
+            bull_state = max(stats, key=lambda k: stats[k]["mean_daily"])
             # Labels: 0=bullish, 1=bearish
             raw_labels = jm.labels_
             jm_labels  = (raw_labels != bull_state).astype(int)
@@ -286,7 +289,7 @@ class RegimeFramework:
                     block_end = pd.Timestamp(test_end)
                 block_start = rebal_date
 
-                best_sr  = -np.inf
+                best_sr  = float("-inf")
                 best_lam = self.lambda_grid[0]
 
                 for lam in self.lambda_grid:
@@ -302,12 +305,21 @@ class RegimeFramework:
                         sr     = _sharpe_01_strategy(
                             fc, er_val, rf_val, tc=self.transaction_cost
                         )
-                        if sr > best_sr:
-                            best_sr  = sr
-                            best_lam = lam
+                        if math.isfinite(sr) and sr > best_sr:
+                            best_sr  = float(sr)
+                            best_lam = float(lam)
                     except Exception as exc:
-                        logger.debug("λ=%.3f failed: %s", lam, exc)
+                        logger.warning(
+                            "[%s] λ tuning: λ=%s failed at rebal %s: %s",
+                            a, lam, rebal_date.date(), exc,
+                        )
                         continue
+
+                if not math.isfinite(best_sr):
+                    logger.warning(
+                        "[%s] No finite validation Sharpe at rebal %s — keeping λ=%.3f",
+                        a, rebal_date.date(), best_lam,
+                    )
 
                 logger.info(
                     "  [%s] rebal=%s  best_λ=%.3f  val_SR=%.3f",
