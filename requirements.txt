@@ -2,6 +2,7 @@
 numpy>=1.24
 pandas>=2.0
 scipy>=1.11
+statsmodels>=0.14
 
 # Machine learning
 xgboost>=2.0
@@ -13,7 +14,6 @@ osqp>=0.6
 
 # Data acquisition
 yfinance>=0.2.36
-pandas-datareader>=0.10
 
 # Visualisation
 matplotlib>=3.7
@@ -26,3 +26,6 @@ ipywidgets>=8.0
 
 # Utilities
 tqdm>=4.66
+
+# Testing (docker compose `tests` profile)
+pytest>=7.0
