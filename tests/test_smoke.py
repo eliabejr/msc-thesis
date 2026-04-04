@@ -38,6 +38,38 @@ def test_portfolio_imports():
     assert len(STRATEGY_REGISTRY) == 7
 
 
+def test_time_series_stats_smoke():
+    from src.analysis.time_series_stats import (
+        hp_decompose,
+        hac_ols,
+        spearman_bootstrap_ci,
+    )
+
+    idx = pd.date_range("2020-01-01", periods=80, freq="B")
+    x = pd.Series(np.random.default_rng(0).standard_normal(80), index=idx)
+    trend, cycle = hp_decompose(x, lam=1_600_000.0)
+    assert len(trend) == len(x)
+    assert np.isfinite(trend.iloc[-1])
+    y = np.random.default_rng(1).standard_normal(80)
+    z = np.random.default_rng(2).standard_normal(80)
+    fit = hac_ols(y, z)
+    assert hasattr(fit, "pvalues")
+    rho, lo, hi = spearman_bootstrap_ci(y, z, n_boot=100, seed=0)
+    assert np.isfinite(rho)
+
+
+def test_cluster_stability_cvi_smoke():
+    from src.cluster_stability import internal_validity_scores
+
+    rng = np.random.default_rng(0)
+    X = rng.standard_normal((80, 4))
+    labels = np.r_[np.zeros(40, dtype=int), np.ones(40, dtype=int)]
+    scores = internal_validity_scores(X, labels)
+    assert np.isfinite(scores["silhouette"])
+    assert np.isfinite(scores["davies_bouldin"])
+    assert np.isfinite(scores["calinski_harabasz"])
+
+
 # ── 2. Jump Model ─────────────────────────────────────────────────────────────
 
 def test_jump_model_two_clear_regimes():
