@@ -8,10 +8,14 @@ Single Responsibility : covariance matrix estimation only.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
 from src.config.settings import COV_HL_DAYS
+
+logger = logging.getLogger(__name__)
 
 
 def ewm_covariance(
@@ -43,10 +47,29 @@ def ewm_covariance(
 
     # Pandas EWM covariance
     ewm_cov = hist.ewm(halflife=halflife, min_periods=min_periods).cov().iloc[-len(hist.columns):]
-    cov_mat = ewm_cov.values
+    cov_mat = ewm_cov.values.astype(np.float64, copy=True)
+    cov_mat = (cov_mat + cov_mat.T) * 0.5
 
-    # Ensure PSD via eigenvalue clipping
-    eigvals, eigvecs = np.linalg.eigh(cov_mat)
-    eigvals = np.maximum(eigvals, 1e-8)
-    cov_mat = eigvecs @ np.diag(eigvals) @ eigvecs.T
-    return cov_mat
+    if not np.all(np.isfinite(cov_mat)):
+        vols = hist.std(ddof=1).fillna(0.01)
+        logger.debug("Non-finite EWM covariance at %s; using diagonal.", end_date)
+        return np.diag(vols.values ** 2)
+
+    n = cov_mat.shape[0]
+    scale = float(np.trace(cov_mat) / max(n, 1)) or 1.0
+    # Diagonal loading helps eigh converge on nearly-singular EWM covariances
+    for load in (0.0, 1e-10 * scale, 1e-8 * scale, 1e-6 * scale):
+        try:
+            sym = cov_mat + load * np.eye(n)
+            eigvals, eigvecs = np.linalg.eigh(sym)
+            break
+        except np.linalg.LinAlgError:
+            continue
+    else:
+        vols = hist.std(ddof=1).fillna(0.01)
+        logger.debug("eigh failed after loading at %s; using diagonal.", end_date)
+        return np.diag(vols.values ** 2)
+
+    floor = max(1e-8, 1e-12 * scale)
+    eigvals = np.maximum(eigvals, floor)
+    return eigvecs @ np.diag(eigvals) @ eigvecs.T
