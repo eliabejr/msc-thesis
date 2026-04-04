@@ -21,4 +21,10 @@ run_one notebooks/03_cluster_stability.ipynb 03_executed.ipynb
 run_one notebooks/04_hypothesis_A_stress_and_stability.ipynb 04_executed.ipynb
 run_one notebooks/05_hypothesis_B_calinski_harabasz_and_sample_size.ipynb 05_executed.ipynb
 run_one notebooks/06_hypothesis_C_aggbond_silhouette_crises.ipynb 06_executed.ipynb
-echo "Wrote results/_nbconvert/01–06_executed.ipynb"
+run_one notebooks/07_ablation_A_regime_identification.ipynb 07_executed.ipynb
+run_one notebooks/08_ablation_B_forecasting.ipynb 08_executed.ipynb
+run_one notebooks/09_ablation_C_allocation.ipynb 09_executed.ipynb
+run_one notebooks/10_ablation_D_recalibration.ipynb 10_executed.ipynb
+run_one notebooks/11_ablation_interactions.ipynb 11_executed.ipynb
+run_one notebooks/12_ablation_variance_decomposition.ipynb 12_executed.ipynb
+echo "Wrote results/_nbconvert/01–12_executed.ipynb"
