@@ -151,7 +151,7 @@ The paper uses proprietary data and software that are not publicly available. Th
 |---|---|
 | Bloomberg index data | Yahoo Finance ETF proxies (e.g., IVV for S&P 500) |
 | Gurobi optimizer | CVXPY + OSQP (open-source, same formulation) |
-| — | FRED via `pandas-datareader` for VIX and Treasury yields |
+| — | FRED via public graph CSV export for VIX and Treasury yields |
 
 Results may differ slightly from the paper due to ETF tracking differences and minor data-vendor discrepancies. The algorithmic implementation is identical to the paper's description.
 

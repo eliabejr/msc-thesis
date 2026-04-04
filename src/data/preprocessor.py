@@ -16,9 +16,32 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
-from src.config.settings import ASSETS, TRADING_DAYS_YEAR
+from src.config.settings import TRADING_DAYS_YEAR
 
 logger = logging.getLogger(__name__)
+
+
+def _ffill_and_zero_leading(
+    df: pd.DataFrame,
+    *,
+    fill_value: float = 0.0,
+) -> pd.DataFrame:
+    """
+    Forward-fill each column, then set values *before* the first originally-valid
+    observation to ``fill_value``.
+
+    yFinance staggered ETF inception leaves leading NaNs that ``ffill`` cannot
+    remove. For excess returns, imputing **0** before first trade means “no stake
+    in that asset yet” (no deviation from the risk-free leg used as benchmark).
+    """
+    out = df.ffill()
+    for col in out.columns:
+        raw = df[col]
+        fv = raw.first_valid_index()
+        if fv is None:
+            continue
+        out.loc[out.index < fv, col] = fill_value
+    return out.fillna(fill_value)
 
 
 class DataPreprocessor:
@@ -39,7 +62,7 @@ class DataPreprocessor:
         Parameters
         ----------
         prices : daily adjusted-close prices (columns = asset names)
-        fred   : daily FRED data with columns  ['rf', 'y2', 'y10', 'vix']
+        fred   : daily FRED data with columns  ['rf', 'y2', 'y10', 'vix', ...] (e.g. 'stlfi')
 
         Returns
         -------
@@ -70,14 +93,12 @@ class DataPreprocessor:
         rf_daily       = rf_daily.loc[first_valid:]
         fred_aligned   = fred_aligned.loc[first_valid:]
 
-        # --- 6. Forward-fill remaining NaN (e.g. non-trading FRED days) --
-        excess_returns = excess_returns.ffill()
-        returns        = returns.ffill()
+        # --- 6. Staggered listings: ffill short gaps; 0 excess before first obs. -
+        excess_returns = _ffill_and_zero_leading(excess_returns, fill_value=0.0)
 
-        # Report remaining NaNs
-        na_count = excess_returns.isna().sum().sum()
+        na_count = int(excess_returns.isna().sum().sum())
         if na_count:
-            logger.warning("%d NaN values remain in excess returns.", na_count)
+            logger.warning("%d NaN values remain in excess returns after cleaning.", na_count)
 
         logger.info(
             "Returns shape: %s  [%s → %s]",

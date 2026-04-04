@@ -59,6 +59,7 @@ FRED_SERIES: Dict[str, str] = {
     "y2":       "DGS2",    # 2-year Treasury constant-maturity yield
     "y10":      "DGS10",   # 10-year Treasury constant-maturity yield
     "vix":      "VIXCLS",  # CBOE VIX
+    "stlfi":    "STLFSI",  # St. Louis Fed Financial Stress Index (weekly; aligned in preprocessor)
 }
 
 # ---------------------------------------------------------------------------
