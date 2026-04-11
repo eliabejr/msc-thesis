@@ -31,6 +31,27 @@ import polars as pl
 
 
 # ---------------------------------------------------------------------------
+# Polars: float NaN vs null (agregações)
+# ---------------------------------------------------------------------------
+
+
+def float_nan_to_null(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Converte float IEEE NaN → null em todas as colunas numéricas float.
+
+    Polars .mean()/.std() ignoram null mas propagam NaN; séries de ablation
+    misturam runs válidos com métricas ausentes como NaN, o que zera médias
+    nos gráficos. Use após ``pl.DataFrame(rows)`` ou ``read_parquet`` legado.
+    """
+    exprs = [
+        pl.col(name).fill_nan(None)
+        for name, dt in zip(df.columns, df.dtypes)
+        if dt in (pl.Float32, pl.Float64)
+    ]
+    return df.with_columns(exprs) if exprs else df
+
+
+# ---------------------------------------------------------------------------
 # Conversores pandas → Polars
 # ---------------------------------------------------------------------------
 

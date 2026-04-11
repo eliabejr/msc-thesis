@@ -145,7 +145,11 @@ class MinVarJMXGB(PortfolioStrategy):
         if regime_fc is None:
             return MinVarPortfolio(self.assets).weights(date, returns, rf, w_prev=w_prev)
 
-        bull = (regime_fc == 0).astype(float)
+        # NumPy only: a pandas Series μ makes `μ @ w` use pd.Series.__matmul__ and breaks cvxpy.
+        if isinstance(regime_fc, pd.Series):
+            bull = (regime_fc.reindex(self.assets).fillna(1) == 0).to_numpy(dtype=np.float64)
+        else:
+            bull = np.asarray((regime_fc == 0).astype(float), dtype=np.float64).reshape(-1)
         n_bull = int(bull.sum())
 
         if n_bull < MIN_BULLISH_ASSETS:

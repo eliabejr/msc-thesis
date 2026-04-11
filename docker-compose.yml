@@ -25,6 +25,8 @@ services:
       - ./results:/home/researcher/app/results
       # Mount notebooks so edits are saved on the host
       - ./notebooks:/home/researcher/app/notebooks
+      # Host `src` must override the image so nbconvert sees latest Python modules
+      - ./src:/home/researcher/app/src
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/home/researcher/app
@@ -63,6 +65,8 @@ services:
   tests:
     image: shu2024:latest
     container_name: shu2024_tests
+    volumes:
+      - ./src:/home/researcher/app/src
     environment:
       - PYTHONUNBUFFERED=1
       - PYTHONPATH=/home/researcher/app

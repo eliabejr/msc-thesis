@@ -176,14 +176,29 @@ class JumpModel:
     ) -> np.ndarray:
         """K-means++ initialisation."""
         T = X.shape[0]
-        idx = [rng.integers(T)]
+        if T == 0:
+            raise ValueError("Cannot initialise centroids with empty X.")
+
+        idx = [int(rng.integers(T))]
         for _ in range(K - 1):
             dists = np.array([
                 min(0.5 * np.sum((X[i] - X[c]) ** 2) for c in idx)
                 for i in range(T)
             ])
-            probs = dists / dists.sum()
-            idx.append(rng.choice(T, p=probs))
+            dists = np.nan_to_num(dists, nan=0.0, posinf=0.0, neginf=0.0)
+            dists = np.maximum(dists, 0.0)
+            s = float(dists.sum())
+            if s <= 0.0 or not np.isfinite(s):
+                # Identical rows / zero variance — `rng.choice(..., p=)` would be NaN or invalid.
+                pool = [i for i in range(T) if i not in idx]
+                if not pool:
+                    idx.append(int(rng.integers(T)))
+                else:
+                    idx.append(int(rng.choice(pool)))
+            else:
+                probs = dists / s
+                probs = probs / probs.sum()
+                idx.append(int(rng.choice(T, p=probs)))
         return X[idx]  # (K, D)
 
     def _assign_dp(

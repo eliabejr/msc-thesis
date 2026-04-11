@@ -75,6 +75,7 @@ from src.ablation.volatility_estimators import (
     rolling_rogers_satchell,
     rolling_yang_zhang,
 )
+from src.ablation.polars_utils import float_nan_to_null
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,13 @@ class AblationConfig:
         return asdict(self)
 
 
+def _metric_nan_to_none(value: Any) -> Any:
+    """Polars ignora null em .mean() mas propaga float NaN — usa None para ausentes."""
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    return value
+
+
 @dataclass
 class AblationResult:
     """
@@ -167,7 +175,7 @@ class AblationResult:
     inference_time_ms:      float = np.nan
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {k: _metric_nan_to_none(v) for k, v in asdict(self).items()}
 
 
 # ---------------------------------------------------------------------------
@@ -278,21 +286,21 @@ def prepare_ablation_data(
             close = (1 + er[asset]).cumprod()
             close.name = "close"
             ohlc = pd.DataFrame({
-                "open":  close.shift(1).fillna(method="bfill"),
+                "open":  close.shift(1).bfill(),
                 "high":  close * 1.001,
                 "low":   close * 0.999,
                 "close": close,
             })
 
     # Alinhar ao índice de er
-    ohlc = ohlc.reindex(er.index).fillna(method="ffill").dropna()
+    ohlc = ohlc.reindex(er.index).ffill().dropna()
 
     o = ohlc["open"].values
     h = ohlc["high"].values
     l = ohlc["low"].values
     c = ohlc["close"].values
 
-    # --- Estimadores de volatilidade ---
+    # --- Estimadores de volatilidade (comprimento = ohlc) ---
     vol_estimators: Dict[str, np.ndarray] = {
         "close_to_close":   rolling_close_to_close(c,          window=21),
         "parkinson":        rolling_parkinson(h, l,            window=21),
@@ -300,6 +308,11 @@ def prepare_ablation_data(
         "rogers_satchell":  rolling_rogers_satchell(o, h, l, c, window=21),
         "yang_zhang":       rolling_yang_zhang(o, h, l, c,    window=21),
     }
+    # Alinha ao índice completo de er (run_single_ablation usa er.index)
+    vol_idx = ohlc.index
+    for key, arr in list(vol_estimators.items()):
+        s = pd.Series(arr, index=vol_idx).reindex(er.index).ffill().bfill()
+        vol_estimators[key] = s.values.astype(np.float64, copy=False)
 
     # --- Features padrão ---
     ret_builder   = ReturnFeatureBuilder()
@@ -343,7 +356,8 @@ def _generate_consensus_regimes(
         votes[:, seed] = lbl
 
     consensus = (votes.mean(axis=1) >= 0.5).astype(int)
-    return consensus
+    cons = pd.Series(consensus, index=X.index).reindex(features.index).ffill().bfill()
+    return cons.fillna(0).astype(int).values
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +471,8 @@ def run_single_ablation(
             er_test = er[asset].reindex(test_idx).fillna(0.0).values
             port_ret = _simple_portfolio(predicted, er_test, config.gamma_trade)
 
-            # Alinha true_regimes ao test_idx
-            true_block = _align_true_regimes(true_regimes, feat_enriched.index, test_idx)
+            # Alinha true_regimes ao test_idx (true_regimes tem len = features.index, não feat_enriched)
+            true_block = _align_true_regimes(true_regimes, features.index, test_idx)
 
             all_preds.append(predicted)
             all_true.append(true_block)
@@ -641,7 +655,7 @@ def _align_true_regimes(
     test_idx:     pd.DatetimeIndex,
 ) -> np.ndarray:
     """Alinha o array de true_regimes (comprimento do feat_index) ao test_idx."""
-    full = pd.Series(true_regimes, index=feat_index[:len(true_regimes)])
+    full = pd.Series(true_regimes, index=feat_index)
     aligned = full.reindex(test_idx).ffill().fillna(0)
     return aligned.values.astype(int)
 
@@ -994,6 +1008,8 @@ def analyze_ablation(
     )
     from scipy.stats import friedmanchisquare
 
+    results = float_nan_to_null(results)
+
     # Pivot: assets × configs
     df_pd = results.to_pandas()
     perf_matrix = df_pd.pivot_table(
@@ -1003,31 +1019,36 @@ def analyze_ablation(
     configs    = perf_matrix.columns.tolist()
     baseline   = "baseline" if "baseline" in configs else configs[0]
 
-    # 1. Friedman test
-    groups = [perf_matrix[c].dropna().values for c in configs if len(perf_matrix[c].dropna()) > 0]
-    min_len = min(len(g) for g in groups)
-    groups  = [g[:min_len] for g in groups]
+    # Friedman: medidas repetidas — mesmos ativos em todas as condições
+    perf_fried = perf_matrix.dropna(how="any")
+    if perf_fried.shape[0] < 3:
+        perf_fried = perf_matrix
 
-    try:
-        fstat, fp = friedmanchisquare(*groups)
-    except Exception:
-        fstat, fp = np.nan, 1.0
+    groups = [perf_fried[c].to_numpy(dtype=float, copy=False) for c in configs]
+    groups = [g for g in groups if len(g) >= 3]
+    fstat, fp = np.nan, 1.0
+    if len(groups) == len(configs) and len(groups) >= 3:
+        try:
+            fstat, fp = friedmanchisquare(*groups)
+        except Exception:
+            fstat, fp = np.nan, 1.0
 
     friedman = {"statistic": fstat, "p_value": fp, "significant": fp < alpha}
 
-    # 2. Pairwise comparisons vs. baseline
+    # 2. Pairwise comparisons vs. baseline (pareamento por ativo)
     pairwise_rows = []
     if fp < alpha and baseline in perf_matrix.columns:
-        base_vals = perf_matrix[baseline].dropna().values
         for config in configs:
             if config == baseline:
                 continue
-            cfg_vals = perf_matrix[config].dropna().values
-            n = min(len(base_vals), len(cfg_vals))
-            if n < 3:
+            pair = perf_matrix[[baseline, config]].dropna(how="any")
+            if len(pair) < 5:
                 continue
-            test = wilcoxon_test(base_vals[:n], cfg_vals[:n], alpha=alpha)
-            d    = cohens_d(cfg_vals[:n], base_vals[:n])
+            base_vals = pair[baseline].to_numpy(dtype=float, copy=False)
+            cfg_vals = pair[config].to_numpy(dtype=float, copy=False)
+            n = len(base_vals)
+            test = wilcoxon_test(base_vals, cfg_vals, alpha=alpha)
+            d    = cohens_d(cfg_vals, base_vals)
             pairwise_rows.append({
                 "config":       config,
                 "vs_baseline":  baseline,
@@ -1052,14 +1073,28 @@ def analyze_ablation(
         ).drop(columns=["name"])
         pairwise_df["significant"] = pairwise_df["reject_h0"]
 
-    # 3. Decomposição de variância
-    total_var = df_pd[metric].var()
-    config_var = perf_matrix.var(axis=0).mean() if not perf_matrix.empty else 0
-    asset_var  = perf_matrix.var(axis=1).mean() if not perf_matrix.empty else 0
+    # 3. Após pivot, variância amostral (ddof=1) exige ≥2 linhas/colunas não degeneradas
+    total_var = float(df_pd[metric].var()) if len(df_pd) > 1 else 0.0
+    n_a, n_c = perf_matrix.shape
+    if n_a < 2:
+        config_var, asset_var = 0.0, 0.0
+    elif n_c < 2:
+        asset_var = float(perf_matrix.var(axis=1, skipna=True).mean())
+        config_var = 0.0
+    else:
+        config_var = float(np.nanmean(perf_matrix.var(axis=0, skipna=True).to_numpy(dtype=float)))
+        asset_var = float(np.nanmean(perf_matrix.var(axis=1, skipna=True).to_numpy(dtype=float)))
+        if not np.isfinite(config_var):
+            config_var = 0.0
+        if not np.isfinite(asset_var):
+            asset_var = 0.0
     variance_decomp = {
         "config_contribution": float(config_var / total_var) if total_var > 0 else 0.0,
         "asset_contribution":  float(asset_var  / total_var) if total_var > 0 else 0.0,
-        "residual":            max(0.0, 1.0 - (config_var + asset_var) / max(total_var, 1e-12)),
+        "residual": max(
+            0.0,
+            1.0 - (config_var + asset_var) / max(total_var, 1e-12),
+        ),
     }
 
     return {
@@ -1105,15 +1140,19 @@ def compare_ablations(
             best_config      = "baseline"
             max_d            = 0.0
 
+        fp = analysis["friedman"]["p_value"]
+        fp = float(fp) if np.isfinite(fp) else 1.0
+        ve = analysis["variance_decomp"]["config_contribution"]
+        ve = float(ve) if np.isfinite(ve) else 0.0
         impact_rows.append({
             "ablation_id":       ablation_id,
             "component":         get_component_name(ablation_id),
             "n_configs":         results["config"].n_unique(),
-            "friedman_p":        round(analysis["friedman"]["p_value"], 4),
+            "friedman_p":        round(fp, 4),
             "significant":       analysis["friedman"]["significant"],
             "best_config":       best_config,
             "best_improvement":  round(best_improvement, 4),
-            "variance_explained":round(analysis["variance_decomp"]["config_contribution"], 4),
+            "variance_explained": round(ve, 4),
             "max_effect_size":   round(max_d, 3),
         })
 

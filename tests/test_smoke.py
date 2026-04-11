@@ -56,6 +56,11 @@ def test_time_series_stats_smoke():
     assert hasattr(fit, "pvalues")
     rho, lo, hi = spearman_bootstrap_ci(y, z, n_boot=100, seed=0)
     assert np.isfinite(rho)
+    rho2, lo2, hi2, p2 = spearman_bootstrap_ci(
+        y, z, n_boot=100, seed=0, return_pvalue=True
+    )
+    assert rho2 == pytest.approx(rho)
+    assert np.isfinite(p2)
 
 
 def test_cluster_stability_cvi_smoke():
@@ -68,6 +73,10 @@ def test_cluster_stability_cvi_smoke():
     assert np.isfinite(scores["silhouette"])
     assert np.isfinite(scores["davies_bouldin"])
     assert np.isfinite(scores["calinski_harabasz"])
+    assert np.isfinite(scores["calinski_harabasz_per_n"])
+    assert scores["calinski_harabasz_per_n"] == pytest.approx(
+        scores["calinski_harabasz"] / 80.0
+    )
 
 
 # ── 2. Jump Model ─────────────────────────────────────────────────────────────
@@ -209,6 +218,32 @@ def test_ew_jmxgb_fewer_than_min_bullish():
         regime_fc=regime_fc,
     )
     assert w.sum() == pytest.approx(0.0)   # 100% risk-free
+
+
+def test_minvar_jmxgb_pandas_regime_fc_uses_numpy_mu():
+    """Regime Series must not flow into cvxpy as pandas (μ @ w matmul bug)."""
+    from src.portfolio.strategies import MinVarJMXGB
+    from src.config.settings import ASSETS, MIN_BULLISH_ASSETS
+
+    strat = MinVarJMXGB(ASSETS)
+    rng = np.random.default_rng(7)
+    ret = pd.DataFrame(
+        rng.normal(0, 0.01, (300, len(ASSETS))),
+        columns=ASSETS,
+        index=pd.date_range("2010-01-01", periods=300, freq="B"),
+    )
+    regime_fc = pd.Series(1, index=ASSETS, dtype=int)
+    regime_fc.iloc[: MIN_BULLISH_ASSETS] = 0
+
+    w = strat.weights(
+        date=ret.index[-1],
+        returns=ret,
+        rf=pd.Series(0.0001, index=ret.index),
+        regime_fc=regime_fc,
+        w_prev=np.ones(len(ASSETS)) / len(ASSETS),
+    )
+    assert w.shape == (len(ASSETS),)
+    assert np.isfinite(w).all()
 
 
 # ── 6. Metrics ────────────────────────────────────────────────────────────────

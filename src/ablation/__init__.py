@@ -44,6 +44,7 @@ from src.ablation.polars_utils import (
     load_portfolio_results,
     build_ablation_summary,
     rolling_metrics_polars,
+    float_nan_to_null,
 )
 from src.ablation.statistical_tests import (
     wilcoxon_test,
@@ -107,6 +108,7 @@ __all__ = [
     "load_portfolio_results",
     "build_ablation_summary",
     "rolling_metrics_polars",
+    "float_nan_to_null",
     # Statistical tests
     "wilcoxon_test",
     "friedman_test",

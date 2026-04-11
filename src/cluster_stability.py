@@ -80,16 +80,19 @@ def internal_validity_scores(
     labels: np.ndarray,
 ) -> Dict[str, float]:
     """
-    Silhouette (↑), Davies–Bouldin (↓), Calinski–Harabasz (↑).
+    Silhouette (↑), Davies–Bouldin (↓), Calinski–Harabasz (↑), and CH/n (↑) for
+    scale-free comparison across training windows of different lengths.
 
     Degenerate partitions (single cluster, too few points) yield NaNs.
     """
     X = np.asarray(X, dtype=float)
     labels = np.asarray(labels, dtype=int)
+    n_obs = int(X.shape[0])
     out: Dict[str, float] = {
         "silhouette": float("nan"),
         "davies_bouldin": float("nan"),
         "calinski_harabasz": float("nan"),
+        "calinski_harabasz_per_n": float("nan"),
     }
     if X.shape[0] < 4 or X.shape[0] != len(labels):
         return out
@@ -103,7 +106,10 @@ def internal_validity_scores(
         except Exception:
             pass
         try:
-            out["calinski_harabasz"] = float(calinski_harabasz_score(X, labels))
+            ch = float(calinski_harabasz_score(X, labels))
+            out["calinski_harabasz"] = ch
+            if n_obs > 0 and np.isfinite(ch):
+                out["calinski_harabasz_per_n"] = ch / n_obs
         except Exception:
             pass
         return out
@@ -117,7 +123,10 @@ def internal_validity_scores(
     except Exception as exc:
         logger.debug("davies_bouldin_score failed: %s", exc)
     try:
-        out["calinski_harabasz"] = float(calinski_harabasz_score(X, labels))
+        ch = float(calinski_harabasz_score(X, labels))
+        out["calinski_harabasz"] = ch
+        if n_obs > 0 and np.isfinite(ch):
+            out["calinski_harabasz_per_n"] = ch / n_obs
     except Exception as exc:
         logger.debug("calinski_harabasz_score failed: %s", exc)
     return out
@@ -171,6 +180,7 @@ def build_internal_validity_df(
                         "silhouette": float("nan"),
                         "davies_bouldin": float("nan"),
                         "calinski_harabasz": float("nan"),
+                        "calinski_harabasz_per_n": float("nan"),
                         "has_features": False,
                     }
                 )
@@ -263,12 +273,18 @@ def summarize_internal_validity_by_asset(cvi_df: pd.DataFrame) -> pd.DataFrame:
     else:
         sub = cvi_df
     g = sub.groupby("Asset")[
-        ["silhouette", "davies_bouldin", "calinski_harabasz"]
+        [
+            "silhouette",
+            "davies_bouldin",
+            "calinski_harabasz",
+            "calinski_harabasz_per_n",
+        ]
     ].mean()
     g.columns = [
         "Silhouette (mean)",
         "Davies–Bouldin (mean)",
         "Calinski–Harabasz (mean)",
+        "Calinski–Harabasz / n (mean)",
     ]
     return g
 

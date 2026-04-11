@@ -6,14 +6,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export THESIS_FAST_NOTEBOOKS="${THESIS_FAST_NOTEBOOKS:-1}"
+NBEXEC_TIMEOUT="${NBEXEC_TIMEOUT:-7200}"
+NBEXEC_TIMEOUT_ABLATION="${NBEXEC_TIMEOUT_ABLATION:-43200}"
 mkdir -p results/_nbconvert
 run_one() {
+  local timeout="${3:-$NBEXEC_TIMEOUT}"
   docker compose run --rm -w /home/researcher/app \
     -e THESIS_FAST_NOTEBOOKS="$THESIS_FAST_NOTEBOOKS" \
     notebooks \
     jupyter nbconvert --to notebook --execute "$1" \
     --output-dir results/_nbconvert --output "$2" \
-    --ExecutePreprocessor.timeout=7200
+    --ExecutePreprocessor.timeout="$timeout"
 }
 run_one notebooks/01_baseline_replication.ipynb 01_executed.ipynb
 run_one notebooks/02_recalibration_sensitivity.ipynb 02_executed.ipynb
@@ -21,10 +24,10 @@ run_one notebooks/03_cluster_stability.ipynb 03_executed.ipynb
 run_one notebooks/04_hypothesis_A_stress_and_stability.ipynb 04_executed.ipynb
 run_one notebooks/05_hypothesis_B_calinski_harabasz_and_sample_size.ipynb 05_executed.ipynb
 run_one notebooks/06_hypothesis_C_aggbond_silhouette_crises.ipynb 06_executed.ipynb
-run_one notebooks/07_ablation_A_regime_identification.ipynb 07_executed.ipynb
-run_one notebooks/08_ablation_B_forecasting.ipynb 08_executed.ipynb
-run_one notebooks/09_ablation_C_allocation.ipynb 09_executed.ipynb
-run_one notebooks/10_ablation_D_recalibration.ipynb 10_executed.ipynb
-run_one notebooks/11_ablation_interactions.ipynb 11_executed.ipynb
-run_one notebooks/12_ablation_variance_decomposition.ipynb 12_executed.ipynb
+run_one notebooks/07_ablation_A_regime_identification.ipynb 07_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
+run_one notebooks/08_ablation_B_forecasting.ipynb 08_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
+run_one notebooks/09_ablation_C_allocation.ipynb 09_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
+run_one notebooks/10_ablation_D_recalibration.ipynb 10_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
+run_one notebooks/11_ablation_interactions.ipynb 11_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
+run_one notebooks/12_ablation_variance_decomposition.ipynb 12_executed.ipynb "$NBEXEC_TIMEOUT_ABLATION"
 echo "Wrote results/_nbconvert/01–12_executed.ipynb"

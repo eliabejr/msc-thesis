@@ -5,7 +5,7 @@ and aligning macro series to JM training windows (same rule as Notebook 03).
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -117,13 +117,19 @@ def spearman_bootstrap_ci(
     n_boot: int = 2000,
     seed: int = 0,
     alpha: float = 0.05,
-) -> Tuple[float, float, float]:
+    return_pvalue: bool = False,
+) -> Union[Tuple[float, float, float], Tuple[float, float, float, float]]:
     """
     Spearman correlation with percentile bootstrap CI on valid paired rows.
+
+    When ``return_pvalue`` is True, also returns the asymptotic two-sided
+    p-value from ``scipy.stats.spearmanr`` on the same valid pairs (for multiple
+    testing corrections alongside the bootstrap CI).
 
     Returns
     -------
     rho_hat, lo, hi
+        or, if ``return_pvalue``, rho_hat, lo, hi, p_value
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -131,8 +137,11 @@ def spearman_bootstrap_ci(
     x, y = x[m], y[m]
     n = len(x)
     if n < 5:
+        if return_pvalue:
+            return float("nan"), float("nan"), float("nan"), float("nan")
         return float("nan"), float("nan"), float("nan")
-    rho_hat, _ = stats.spearmanr(x, y)
+    rho_hat, p_asymp = stats.spearmanr(x, y)
+    p_asymp = float(p_asymp) if p_asymp is not None and np.isfinite(p_asymp) else float("nan")
     rng = np.random.default_rng(seed)
     boot = np.empty(n_boot, dtype=float)
     for b in range(n_boot):
@@ -140,4 +149,6 @@ def spearman_bootstrap_ci(
         r, _ = stats.spearmanr(x[idx], y[idx])
         boot[b] = r
     lo, hi = np.quantile(boot, [alpha / 2, 1.0 - alpha / 2])
+    if return_pvalue:
+        return float(rho_hat), float(lo), float(hi), p_asymp
     return float(rho_hat), float(lo), float(hi)
