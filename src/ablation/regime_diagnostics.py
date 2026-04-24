@@ -27,7 +27,7 @@ import numpy as np
 import numba as nb
 from sklearn.metrics import adjusted_rand_score
 
-from src.ablation.jit_metrics import compute_add_jit, false_alarm_rate_jit
+from src.ablation.jit_metrics import compute_add_jit, false_alarm_rate_jit, miss_rate_jit
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +49,19 @@ def detect_changepoints(labels: np.ndarray) -> np.ndarray:
     labels = np.asarray(labels)
     changes = np.where(np.diff(labels) != 0)[0] + 1
     return changes
+
+
+def changepoint_binary_labels(labels: np.ndarray) -> np.ndarray:
+    """
+    Converte um sinal de regimes em uma série binária de changepoints.
+
+    O elemento ``t`` da saída indica se houve mudança entre ``labels[t-1]`` e
+    ``labels[t]``. A série resultante tem comprimento ``T-1``.
+    """
+    arr = np.asarray(labels)
+    if len(arr) < 2:
+        return np.asarray([], dtype=np.int64)
+    return (arr[1:] != arr[:-1]).astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +91,19 @@ def compute_add(
     tl = np.asarray(true_labels, dtype=np.int64)
     pl = np.asarray(pred_labels, dtype=np.int64)
     return float(compute_add_jit(tl, pl, max_delay))
+
+
+def compute_miss_rate(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+    max_delay:   int = 126,
+) -> float:
+    """
+    Miss Rate: fração de mudanças reais não detectadas dentro de ``max_delay``.
+    """
+    tl = np.asarray(true_labels, dtype=np.int64)
+    pl = np.asarray(pred_labels, dtype=np.int64)
+    return float(miss_rate_jit(tl, pl, max_delay))
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +200,92 @@ def regime_concordance(
     return float((a == b).mean())
 
 
+def binary_accuracy(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+) -> float:
+    """
+    Accuracy binária simples entre dois sinais alinhados.
+    """
+    tl = np.asarray(true_labels)
+    pl = np.asarray(pred_labels)
+    if len(tl) != len(pl) or len(tl) == 0:
+        return 0.0
+    return float((tl == pl).mean())
+
+
+def binary_balanced_accuracy(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+) -> float:
+    """
+    Balanced Accuracy binária.
+
+    Calcula a média do recall das classes presentes em ``true_labels``.
+    """
+    tl = np.asarray(true_labels)
+    pl = np.asarray(pred_labels)
+    if len(tl) != len(pl) or len(tl) == 0:
+        return 0.0
+
+    recalls: List[float] = []
+    for cls in (0, 1):
+        mask = tl == cls
+        support = int(mask.sum())
+        if support > 0:
+            recalls.append(float((pl[mask] == cls).mean()))
+
+    if not recalls:
+        return 0.0
+    return float(np.mean(recalls))
+
+
+def changepoint_detection_summary(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+    max_delay:   int = 126,
+) -> Dict[str, float]:
+    """
+    Resumo das métricas de detecção de changepoint.
+
+    Sejam ``c_t = 1[y_t != y_{t-1}]`` e ``ĉ_t = 1[ŷ_t != ŷ_{t-1}]`` para
+    ``t = 2, ..., T``. Então:
+
+    - ``Accuracy_cp = (1/(T-1)) * Σ 1[c_t = ĉ_t]``
+    - ``BalancedAccuracy_cp = (Recall_change + Recall_stable) / 2``
+    - ``FAR = FP_stable / N_stable``
+    - ``MissRate = MissedChanges / N_changes``
+    """
+    tl = np.asarray(true_labels, dtype=np.int64)
+    pl = np.asarray(pred_labels, dtype=np.int64)
+    true_cp = changepoint_binary_labels(tl)
+    pred_cp = changepoint_binary_labels(pl)
+    return {
+        "ADD": compute_add(tl, pl, max_delay),
+        "FAR": float(false_alarm_rate_jit(tl, pl)),
+        "MissRate": compute_miss_rate(tl, pl, max_delay),
+        "CP_Accuracy": binary_accuracy(true_cp, pred_cp),
+        "CP_BalancedAccuracy": binary_balanced_accuracy(true_cp, pred_cp),
+    }
+
+
+def state_classification_summary(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Resumo das métricas de classificação de estado do regime.
+    """
+    tl = np.asarray(true_labels, dtype=np.int64)
+    pl = np.asarray(pred_labels, dtype=np.int64)
+    return {
+        "StateAccuracy": binary_accuracy(tl, pl),
+        "StateBalancedAccuracy": binary_balanced_accuracy(tl, pl),
+        "Concordance": regime_concordance(tl, pl),
+        "ARI": compute_ari(tl, pl),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Resumo diagnóstico completo
 # ---------------------------------------------------------------------------
@@ -194,18 +306,25 @@ def regime_diagnostics_summary(
 
     Returns
     -------
-    dict com: ADD, FAR, ARI, Concordance, MRL_all, MRL_bull, MRL_bear
+    dict com: métricas de changepoint, estado e estabilidade
     """
     tl = np.asarray(true_labels, dtype=np.int64)
     pl = np.asarray(pred_labels, dtype=np.int64)
 
     mrl = mean_run_length(pl)
+    cp = changepoint_detection_summary(tl, pl, max_delay)
+    state = state_classification_summary(tl, pl)
 
     return {
-        "ADD":         compute_add(tl, pl, max_delay),
-        "FAR":         float(false_alarm_rate_jit(tl, pl)),
-        "ARI":         compute_ari(tl, pl),
-        "Concordance": regime_concordance(tl, pl),
+        "ADD":         cp["ADD"],
+        "FAR":         cp["FAR"],
+        "MissRate":    cp["MissRate"],
+        "CP_Accuracy": cp["CP_Accuracy"],
+        "CP_BalancedAccuracy": cp["CP_BalancedAccuracy"],
+        "ARI":         state["ARI"],
+        "Concordance": state["Concordance"],
+        "StateAccuracy": state["StateAccuracy"],
+        "StateBalancedAccuracy": state["StateBalancedAccuracy"],
         "MRL_all":     mrl["mean_all"],
         "MRL_bull":    mrl["mean_bull"],
         "MRL_bear":    mrl["mean_bear"],

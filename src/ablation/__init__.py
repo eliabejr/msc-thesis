@@ -27,15 +27,22 @@ from src.ablation.jit_metrics import (
     sharpe_ratio_jit,
     compute_add_jit,
     false_alarm_rate_jit,
+    miss_rate_jit,
     compute_metrics_array,
 )
 from src.ablation.regime_diagnostics import (
     detect_changepoints,
+    changepoint_binary_labels,
     compute_add,
+    compute_miss_rate,
     compute_ari,
     mean_run_length,
+    binary_accuracy,
+    binary_balanced_accuracy,
+    changepoint_detection_summary,
     regime_concordance,
     regime_diagnostics_summary,
+    state_classification_summary,
 )
 from src.ablation.polars_utils import (
     series_to_polars,
@@ -68,6 +75,9 @@ from src.ablation.ablation_runner import (
     ABLATION_D1_CONFIGS,
     ABLATION_I1_CONFIGS,
     ABLATION_I2_CONFIGS,
+    ABLATION_W1_CONFIGS,
+    W1_BUDGET_MAX,
+    W1_VALIDATION_FRACTION,
     prepare_ablation_data,
     run_single_ablation,
     run_ablation_sweep,
@@ -76,6 +86,7 @@ from src.ablation.ablation_runner import (
     get_component_name,
     analyze_ablation,
     compare_ablations,
+    best_config_argmax,
 )
 
 __all__ = [
@@ -93,14 +104,21 @@ __all__ = [
     "sharpe_ratio_jit",
     "compute_add_jit",
     "false_alarm_rate_jit",
+    "miss_rate_jit",
     "compute_metrics_array",
     # Regime diagnostics
     "detect_changepoints",
+    "changepoint_binary_labels",
     "compute_add",
+    "compute_miss_rate",
     "compute_ari",
     "mean_run_length",
+    "binary_accuracy",
+    "binary_balanced_accuracy",
+    "changepoint_detection_summary",
     "regime_concordance",
     "regime_diagnostics_summary",
+    "state_classification_summary",
     # Polars utils
     "series_to_polars",
     "dataframe_to_polars",
@@ -130,6 +148,9 @@ __all__ = [
     "ABLATION_D1_CONFIGS",
     "ABLATION_I1_CONFIGS",
     "ABLATION_I2_CONFIGS",
+    "ABLATION_W1_CONFIGS",
+    "W1_BUDGET_MAX",
+    "W1_VALIDATION_FRACTION",
     "prepare_ablation_data",
     "run_single_ablation",
     "run_ablation_sweep",
@@ -138,4 +159,5 @@ __all__ = [
     "get_component_name",
     "analyze_ablation",
     "compare_ablations",
+    "best_config_argmax",
 ]

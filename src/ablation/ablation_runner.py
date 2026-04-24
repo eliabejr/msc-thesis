@@ -60,6 +60,7 @@ from src.ablation.jit_metrics import (
     sortino_ratio_jit,
     max_drawdown_jit,
     sharpe_ratio_jit,
+    simple_portfolio_jit,
 )
 from src.ablation.regime_diagnostics import (
     compute_add,
@@ -80,6 +81,15 @@ from src.ablation.polars_utils import float_nan_to_null
 logger = logging.getLogger(__name__)
 
 N_BOOTSTRAP = 20  # número de replicações bootstrap por configuração
+
+# Budget máximo de combinações do sweep conjunto W1 (jump_penalty × vol × k × recal × model).
+# Grid foi dimensionado para ficar dentro deste teto; se crescer, aplicar redução determinística.
+W1_BUDGET_MAX: int = 150
+
+# Fração do período de teste usada como validação walk-forward para seleção
+# de hiperparâmetros sem leakage. Remanescente (1 - fração) é o holdout de
+# reporting. Aplicado aos retornos já concatenados em run_single_ablation().
+W1_VALIDATION_FRACTION: float = 0.60
 
 
 # ---------------------------------------------------------------------------
@@ -151,9 +161,13 @@ class AblationResult:
     add:                    float = np.nan
     miss_rate:              float = np.nan
     false_alarm_rate:       float = np.nan
+    cp_accuracy:            float = np.nan
+    cp_balanced_accuracy:   float = np.nan
 
     # Métricas de previsão
     accuracy:               float = np.nan
+    state_accuracy:         float = np.nan
+    state_balanced_accuracy: float = np.nan
     f1_score:               float = np.nan
 
     # Métricas de alocação
@@ -164,6 +178,16 @@ class AblationResult:
     max_drawdown:           float = np.nan
     calmar_ratio:           float = np.nan
     turnover:               float = np.nan
+
+    # Wealth curve-based metrics (alvo financeiro do sweep conjunto W1).
+    # terminal_wealth:      riqueza final no período completo de teste (reporting)
+    # terminal_wealth_val:  riqueza final na janela de validação walk-forward (seleção sem leakage)
+    # terminal_wealth_oos:  riqueza final na janela de holdout (avaliação honesta da config escolhida)
+    # n_position_switches:  número total de trocas de posição (proxy de instabilidade)
+    terminal_wealth:        float = np.nan
+    terminal_wealth_val:    float = np.nan
+    terminal_wealth_oos:    float = np.nan
+    n_position_switches:    float = np.nan
 
     # Métricas de estabilidade
     regime_ari:             float = np.nan
@@ -423,8 +447,6 @@ def run_single_ablation(
         all_preds: List[np.ndarray] = []
         all_true:  List[np.ndarray] = []
         all_returns: List[np.ndarray] = []
-        all_labels:  List[np.ndarray] = []
-
         # Expanding window com recalibração
         for train_end, test_start_bl, test_end_bl in blocks:
             train_idx = idx[(idx <= train_end)]
@@ -469,7 +491,13 @@ def run_single_ablation(
 
             # ------ Stage 3: Allocation ------
             er_test = er[asset].reindex(test_idx).fillna(0.0).values
-            port_ret = _simple_portfolio(predicted, er_test, config.gamma_trade)
+            port_ret = _simple_portfolio(
+                pred_labels  = predicted,
+                er           = er_test,
+                gamma_trade  = config.gamma_trade,
+                gamma_risk   = config.gamma_risk,
+                leverage_max = config.leverage_max,
+            )
 
             # Alinha true_regimes ao test_idx (true_regimes tem len = features.index, não feat_enriched)
             true_block = _align_true_regimes(true_regimes, features.index, test_idx)
@@ -477,7 +505,6 @@ def run_single_ablation(
             all_preds.append(predicted)
             all_true.append(true_block)
             all_returns.append(port_ret)
-            all_labels.append(predicted)
 
         if not all_preds:
             return result
@@ -491,13 +518,18 @@ def run_single_ablation(
         # Métricas de detecção
         diag = regime_diagnostics_summary(true_all, preds_all)
         result.add                = diag["ADD"]
+        result.miss_rate          = diag["MissRate"]
         result.false_alarm_rate   = diag["FAR"]
+        result.cp_accuracy        = diag["CP_Accuracy"]
+        result.cp_balanced_accuracy = diag["CP_BalancedAccuracy"]
         result.regime_ari         = diag["ARI"]
         result.regime_agreement   = diag["Concordance"]
         result.mean_run_length    = diag["MRL_all"]
 
         # Métricas de classificação
-        result.accuracy = float(np.mean(true_all == preds_all))
+        result.accuracy = diag["StateAccuracy"]
+        result.state_accuracy = diag["StateAccuracy"]
+        result.state_balanced_accuracy = diag["StateBalancedAccuracy"]
         from sklearn.metrics import f1_score
         result.f1_score = float(f1_score(true_all, preds_all, average="binary", zero_division=0))
 
@@ -510,9 +542,20 @@ def run_single_ablation(
         result.total_return  = float(np.sum(rets_all) * TRADING_DAYS_YEAR / len(rets_all)) if len(rets_all) else np.nan
         result.volatility    = float(np.std(rets_all, ddof=1) * np.sqrt(TRADING_DAYS_YEAR))
 
-        # Turnover estimado (mudanças de posição)
+        # Wealth curve: valor final de cumprod(1 + ret), iniciando em 1.0.
+        # Split walk-forward: primeiro V% do período vira janela de validação
+        # (para seleção sem leakage) e o restante vira holdout (para reporting).
+        result.terminal_wealth = float(np.prod(1.0 + rets_all))
+        if len(rets_all) >= 2:
+            split = max(1, int(round(len(rets_all) * W1_VALIDATION_FRACTION)))
+            split = min(split, len(rets_all) - 1)
+            result.terminal_wealth_val = float(np.prod(1.0 + rets_all[:split]))
+            result.terminal_wealth_oos = float(np.prod(1.0 + rets_all[split:]))
+
+        # Turnover e número absoluto de trocas de posição (diagnóstico de instabilidade)
         pos_changes = np.abs(np.diff(np.concatenate([[0], preds_all])))
         result.turnover = float(pos_changes.mean() * TRADING_DAYS_YEAR)
+        result.n_position_switches = float(pos_changes.sum())
 
         # Tempo computacional
         result.training_time_seconds = time.perf_counter() - t0
@@ -617,7 +660,6 @@ def _get_forecaster(config: AblationConfig):
             n_estimators=config.n_estimators,
             max_depth=config.max_depth,
             learning_rate=0.3,
-            use_label_encoder=False,
             eval_metric="logloss",
             random_state=42,
             n_jobs=1,
@@ -631,22 +673,35 @@ def _simple_portfolio(
     pred_labels: np.ndarray,
     er:          np.ndarray,
     gamma_trade: float,
+    gamma_risk:  float,
+    leverage_max: float,
 ) -> np.ndarray:
     """
-    Portfólio 0/1 simples: 100% no ativo se bull, 0% se bear.
-    Penaliza mudanças de posição proporcionalmente a gamma_trade.
+    Regra de alocação reduzida (single-asset) para o ablation study.
+
+    - Sinal: `pred_labels[t]` indica bear (=1) vs bull (=0).
+    - Exposição: em bull, mantém uma fração do capital no ativo; em bear, zera.
+    - `gamma_risk` controla o *risk budget*: maior aversão a risco → menor exposição.
+    - `gamma_trade` controla a severidade do custo de transação (via penalização
+      de mudança de posição).
+
+    Observação: Este projeto replica a lógica econômica do Stage 3 (trade-off
+    risco × retorno + fricção de trading) em um setting single-asset para tornar
+    as ablações marginais bem definidas e computacionalmente baratas.
     """
-    n = min(len(pred_labels), len(er))
-    port_ret = np.zeros(n)
-    prev_pos = 0.0
-
-    for t in range(n):
-        pos = 1.0 - float(pred_labels[t])
-        tc  = abs(pos - prev_pos) * TRANSACTION_COST * (1 + gamma_trade)
-        port_ret[t] = pos * er[t] - tc
-        prev_pos = pos
-
-    return port_ret
+    pred_arr = np.asarray(pred_labels, dtype=np.float64)
+    er_arr = np.asarray(er, dtype=np.float64)
+    gamma_trade_val = float(gamma_trade) if gamma_trade is not None else 0.0
+    gamma_risk_val = float(gamma_risk) if gamma_risk is not None else np.nan
+    leverage_max_val = float(leverage_max) if leverage_max is not None else 0.0
+    return simple_portfolio_jit(
+        pred_arr,
+        er_arr,
+        gamma_trade_val,
+        gamma_risk_val,
+        leverage_max_val,
+        float(TRANSACTION_COST),
+    )
 
 
 def _align_true_regimes(
@@ -782,7 +837,7 @@ def run_full_ablation_study(
     results_dir  : diretório para salvar resultados em Parquet
     """
     if ablation_ids is None:
-        ablation_ids = ["A1", "A2", "A3", "B1", "B2", "C1", "C2", "D1", "I1", "I2"]
+        ablation_ids = ["A1", "A2", "A3", "B1", "B2", "C1", "C2", "D1", "I1", "I2", "W1"]
     if assets is None:
         assets = list(ASSETS)
 
@@ -834,6 +889,7 @@ COMPONENT_NAMES = {
     "D1": "Recalibration Frequency",
     "I1": "λ × Estimator (Interaction)",
     "I2": "γ_risk × γ_trade (Interaction)",
+    "W1": "Joint Hyperparameter Sweep (wealth objective)",
 }
 
 
@@ -948,6 +1004,70 @@ ABLATION_I2_CONFIGS: List[AblationConfig] = [
     AblationConfig(name="i2_gr20_gt2", ablation_id="I2", gamma_risk=20.0, gamma_trade=2.0),
 ]
 
+# --- Configurações W1: Joint sweep para maximizar wealth terminal ---
+# Dimensões: jump_penalty × vol_estimator × n_regimes × recal_frequency × forecaster_type.
+# Valores derivados das ablações marginais (A1, A2, A3, B1, D1), reduzidos para caber em W1_BUDGET_MAX.
+_W1_LAMBDAS        = [25.0, 50.0, 100.0]
+_W1_VOL_ESTIMATORS = ["close_to_close", "yang_zhang"]
+_W1_N_REGIMES      = [2, 3]
+_W1_RECAL_FREQS    = ["monthly", "quarterly", "semi-annual", "annual"]
+_W1_FORECASTERS    = ["logistic_regression", "random_forest", "xgboost"]
+
+_W1_VOL_ABBR  = {"close_to_close": "cc", "parkinson": "pk", "yang_zhang": "yz",
+                 "garman_klass": "gk", "rogers_satchell": "rs"}
+_W1_RECAL_ABBR = {"monthly": "mon", "quarterly": "qua", "semi-annual": "sem", "annual": "ann"}
+_W1_FC_ABBR   = {"logistic_regression": "log", "random_forest": "rf", "xgboost": "xgb",
+                 "decision_tree": "tree", "persistence": "pers"}
+
+
+def _build_w1_configs(budget_max: int = W1_BUDGET_MAX) -> List[AblationConfig]:
+    """
+    Monta o grid W1 verificando o budget máximo de combinações.
+
+    Estratégia: produto cartesiano determinístico. Se o produto exceder
+    ``budget_max``, levanta ``ValueError`` com orientação para o usuário
+    reduzir explicitamente alguma dimensão. Mantém a seleção reprodutível
+    e documentada (sem amostragem estocástica implícita).
+    """
+    n_total = (len(_W1_LAMBDAS)
+               * len(_W1_VOL_ESTIMATORS)
+               * len(_W1_N_REGIMES)
+               * len(_W1_RECAL_FREQS)
+               * len(_W1_FORECASTERS))
+    if n_total > budget_max:
+        raise ValueError(
+            f"Grid W1 com {n_total} combinações excede budget={budget_max}. "
+            f"Reduza explicitamente alguma dimensão em _W1_* ou ajuste W1_BUDGET_MAX."
+        )
+
+    configs: List[AblationConfig] = []
+    for lam in _W1_LAMBDAS:
+        for vol in _W1_VOL_ESTIMATORS:
+            for k in _W1_N_REGIMES:
+                for recal in _W1_RECAL_FREQS:
+                    for fc in _W1_FORECASTERS:
+                        name = (
+                            f"w1_l{int(lam)}_"
+                            f"{_W1_VOL_ABBR.get(vol, vol)}_"
+                            f"k{k}_"
+                            f"{_W1_RECAL_ABBR.get(recal, recal)}_"
+                            f"{_W1_FC_ABBR.get(fc, fc)}"
+                        )
+                        configs.append(AblationConfig(
+                            name            = name,
+                            ablation_id     = "W1",
+                            lambda_penalty  = lam,
+                            vol_estimator   = vol,
+                            n_regimes       = k,
+                            recal_frequency = recal,
+                            forecaster_type = fc,
+                        ))
+    return configs
+
+
+ABLATION_W1_CONFIGS: List[AblationConfig] = _build_w1_configs()
+
+
 # Mapa global: ablation_id → lista de configs
 ABLATION_CONFIG_MAP: Dict[str, List[AblationConfig]] = {
     "A1": ABLATION_A1_CONFIGS,
@@ -960,6 +1080,7 @@ ABLATION_CONFIG_MAP: Dict[str, List[AblationConfig]] = {
     "D1": ABLATION_D1_CONFIGS,
     "I1": ABLATION_I1_CONFIGS,
     "I2": ABLATION_I2_CONFIGS,
+    "W1": ABLATION_W1_CONFIGS,
 }
 
 
@@ -978,6 +1099,112 @@ def get_component_name(ablation_id: str) -> str:
 # ---------------------------------------------------------------------------
 # 8. Análise estatística de uma ablation  (§4.1)
 # ---------------------------------------------------------------------------
+
+def best_config_argmax(
+    results:        pl.DataFrame,
+    metric:         str = "terminal_wealth",
+    tiebreak_cols:  Optional[List[Tuple[str, bool]]] = None,
+    higher_is_better: bool = True,
+) -> Dict[str, Any]:
+    """
+    Seleciona a configuração argmax de ``metric`` (média sobre asset × seed).
+
+    Diferente de ``analyze_ablation()``, que compara cada config contra um
+    baseline via ``mean_diff``, este helper faz a seleção direta ``argmax``
+    da média da métrica, com tie-break determinístico. É a semântica correta
+    para o sweep conjunto W1, onde o alvo é a melhor combinação global.
+
+    Parameters
+    ----------
+    results           : DataFrame com colunas 'config' + métricas.
+    metric            : coluna-alvo (ex.: 'terminal_wealth_val' para seleção
+                        walk-forward; 'terminal_wealth' para reporting).
+    tiebreak_cols     : lista de (coluna, higher_is_better) usados como tie-break
+                        na ordem informada. Default: drawdown (menos negativo é
+                        melhor) e turnover (menor é melhor).
+    higher_is_better  : direção do objetivo principal.
+
+    Returns
+    -------
+    dict com:
+      - config         : nome da config argmax
+      - metric_value   : valor médio da métrica
+      - details        : médias de métricas auxiliares (quando disponíveis)
+      - ranking        : DataFrame pandas ordenado por ``metric``
+    """
+    if tiebreak_cols is None:
+        tiebreak_cols = [("max_drawdown", True), ("turnover", False)]
+
+    results = float_nan_to_null(results)
+    if metric not in results.columns or results.is_empty():
+        return {
+            "config": None, "metric_value": float("nan"),
+            "details": {}, "ranking": pd.DataFrame(),
+        }
+
+    # Agrega por config: média sobre assets × seeds para robustez
+    agg_cols = [c for c, _ in tiebreak_cols if c in results.columns]
+    agg_exprs = [pl.col(metric).mean().alias(metric)]
+    for c in agg_cols:
+        agg_exprs.append(pl.col(c).mean().alias(c))
+    ranking = (
+        results.group_by("config")
+               .agg(agg_exprs)
+    )
+
+    # Ordenação canônica: colocar o MELHOR no topo (iloc[0]).
+    # Para isso, ordenamos com ascending=True se a coluna é "lower is better",
+    # e ascending=False se "higher is better".
+    sort_cols: List[pl.Expr] = [pl.col(metric)]
+    descending = [higher_is_better]
+    for col, hib in tiebreak_cols:
+        if col in results.columns:
+            sort_cols.append(pl.col(col))
+            descending.append(hib)
+    ranking = ranking.sort(by=sort_cols, descending=descending)
+
+    top_row = ranking.row(0, named=True)
+    details = {c: float(top_row[c]) for c in agg_cols if c in top_row}
+
+    return {
+        "config":       str(top_row["config"]),
+        "metric_value": float(top_row[metric]) if top_row[metric] is not None else float("nan"),
+        "details":      details,
+        "ranking":      ranking.to_pandas(),
+    }
+
+
+def _build_perf_matrix_polars(
+    results: pl.DataFrame,
+    metric: str,
+) -> Tuple[pl.DataFrame, pd.DataFrame, List[str]]:
+    """
+    Agrega `metric` por asset × config em Polars e retorna a matriz wide.
+
+    Returns
+    -------
+    perf_matrix_pl : pl.DataFrame wide com coluna 'asset' + uma coluna por config
+    perf_matrix_pd : a mesma matriz em pandas, indexada por asset (compatibilidade)
+    configs        : lista de configurações na ordem das colunas da matriz
+    """
+    perf_long = (
+        results.group_by(["asset", "config"])
+               .agg(pl.col(metric).mean().alias(metric))
+               .sort(["asset", "config"])
+    )
+    perf_matrix_pl = (
+        perf_long.pivot(
+            values=metric,
+            index="asset",
+            on="config",
+            aggregate_function="first",
+        )
+        .sort("asset")
+    )
+    configs = [c for c in perf_matrix_pl.columns if c != "asset"]
+    perf_matrix_pd = perf_matrix_pl.to_pandas().set_index("asset") if configs else pd.DataFrame()
+    return perf_matrix_pl, perf_matrix_pd, configs
+
 
 def analyze_ablation(
     results:    pl.DataFrame,
@@ -1009,22 +1236,30 @@ def analyze_ablation(
     from scipy.stats import friedmanchisquare
 
     results = float_nan_to_null(results)
+    if metric not in results.columns:
+        raise ValueError(f"Métrica '{metric}' ausente no DataFrame de resultados.")
 
-    # Pivot: assets × configs
-    df_pd = results.to_pandas()
-    perf_matrix = df_pd.pivot_table(
-        index="asset", columns="config", values=metric, aggfunc="mean"
-    )
+    # Pivot: assets × configs (em Polars no caminho crítico; pandas só na borda)
+    perf_matrix_pl, perf_matrix, configs = _build_perf_matrix_polars(results, metric)
+    if not configs:
+        return {
+            "ablation_id":     results["ablation_id"][0] if "ablation_id" in results.columns else "",
+            "metric":          metric,
+            "perf_matrix":     perf_matrix,
+            "friedman":        {"statistic": np.nan, "p_value": 1.0, "significant": False},
+            "pairwise":        pd.DataFrame(),
+            "variance_decomp": {"config_contribution": 0.0, "asset_contribution": 0.0, "residual": 1.0},
+            "argmax":          best_config_argmax(results, metric=metric, higher_is_better=True),
+        }
 
-    configs    = perf_matrix.columns.tolist()
     baseline   = "baseline" if "baseline" in configs else configs[0]
 
     # Friedman: medidas repetidas — mesmos ativos em todas as condições
-    perf_fried = perf_matrix.dropna(how="any")
-    if perf_fried.shape[0] < 3:
-        perf_fried = perf_matrix
+    perf_fried_pl = perf_matrix_pl.drop_nulls()
+    if perf_fried_pl.height < 3:
+        perf_fried_pl = perf_matrix_pl
 
-    groups = [perf_fried[c].to_numpy(dtype=float, copy=False) for c in configs]
+    groups = [perf_fried_pl[c].to_numpy() for c in configs]
     groups = [g for g in groups if len(g) >= 3]
     fstat, fp = np.nan, 1.0
     if len(groups) == len(configs) and len(groups) >= 3:
@@ -1037,15 +1272,31 @@ def analyze_ablation(
 
     # 2. Pairwise comparisons vs. baseline (pareamento por ativo)
     pairwise_rows = []
-    if fp < alpha and baseline in perf_matrix.columns:
+    if fp < alpha and baseline in configs:
+        perf_long = (
+            results.group_by(["asset", "config"])
+                   .agg(pl.col(metric).mean().alias(metric))
+        )
+        base_pair = (
+            perf_long.filter(pl.col("config") == baseline)
+                     .select(["asset", pl.col(metric).alias("baseline_value")])
+        )
         for config in configs:
             if config == baseline:
                 continue
-            pair = perf_matrix[[baseline, config]].dropna(how="any")
-            if len(pair) < 5:
+            cfg_pair = (
+                perf_long.filter(pl.col("config") == config)
+                         .select(["asset", pl.col(metric).alias("config_value")])
+            )
+            pair = (
+                base_pair.join(cfg_pair, on="asset", how="inner")
+                         .drop_nulls()
+                         .sort("asset")
+            )
+            if pair.height < 5:
                 continue
-            base_vals = pair[baseline].to_numpy(dtype=float, copy=False)
-            cfg_vals = pair[config].to_numpy(dtype=float, copy=False)
+            base_vals = pair["baseline_value"].to_numpy()
+            cfg_vals = pair["config_value"].to_numpy()
             n = len(base_vals)
             test = wilcoxon_test(base_vals, cfg_vals, alpha=alpha)
             d    = cohens_d(cfg_vals, base_vals)
@@ -1074,16 +1325,18 @@ def analyze_ablation(
         pairwise_df["significant"] = pairwise_df["reject_h0"]
 
     # 3. Após pivot, variância amostral (ddof=1) exige ≥2 linhas/colunas não degeneradas
-    total_var = float(df_pd[metric].var()) if len(df_pd) > 1 else 0.0
-    n_a, n_c = perf_matrix.shape
+    total_var = float(results.select(pl.col(metric).var()).item()) if results.height > 1 else 0.0
+    n_a, n_c = perf_matrix_pl.height, len(configs)
     if n_a < 2:
         config_var, asset_var = 0.0, 0.0
     elif n_c < 2:
-        asset_var = float(perf_matrix.var(axis=1, skipna=True).mean())
+        matrix = perf_matrix.to_numpy(dtype=float, copy=False)
+        asset_var = float(np.nanmean(np.nanvar(matrix, axis=1, ddof=1)))
         config_var = 0.0
     else:
-        config_var = float(np.nanmean(perf_matrix.var(axis=0, skipna=True).to_numpy(dtype=float)))
-        asset_var = float(np.nanmean(perf_matrix.var(axis=1, skipna=True).to_numpy(dtype=float)))
+        matrix = perf_matrix.to_numpy(dtype=float, copy=False)
+        config_var = float(np.nanmean(np.nanvar(matrix, axis=0, ddof=1)))
+        asset_var = float(np.nanmean(np.nanvar(matrix, axis=1, ddof=1)))
         if not np.isfinite(config_var):
             config_var = 0.0
         if not np.isfinite(asset_var):
@@ -1097,6 +1350,15 @@ def analyze_ablation(
         ),
     }
 
+    # 4. Seleção direta por argmax (semântica independente do baseline).
+    # Retorna a config com maior média da métrica + diagnósticos de risco
+    # em tie-break. Usada pelo sweep conjunto W1 (sem baseline canônico).
+    higher_is_better = metric not in {"add", "miss_rate", "false_alarm_rate",
+                                      "max_drawdown", "volatility",
+                                      "turnover", "n_position_switches"}
+    argmax = best_config_argmax(results, metric=metric,
+                                higher_is_better=higher_is_better)
+
     return {
         "ablation_id":     results["ablation_id"][0] if "ablation_id" in results.columns else "",
         "metric":          metric,
@@ -1104,6 +1366,7 @@ def analyze_ablation(
         "friedman":        friedman,
         "pairwise":        pairwise_df,
         "variance_decomp": variance_decomp,
+        "argmax":          argmax,
     }
 
 
@@ -1144,16 +1407,33 @@ def compare_ablations(
         fp = float(fp) if np.isfinite(fp) else 1.0
         ve = analysis["variance_decomp"]["config_contribution"]
         ve = float(ve) if np.isfinite(ve) else 0.0
+
+        # Seleção direta argmax (semântica diferente de mean_diff vs baseline):
+        # usada para relatórios do sweep conjunto W1 / rankings pelo alvo financeiro.
+        argmax_info = analysis.get("argmax") or {}
+        argmax_config = argmax_info.get("config")
+        argmax_value  = argmax_info.get("metric_value", float("nan"))
+
         impact_rows.append({
-            "ablation_id":       ablation_id,
-            "component":         get_component_name(ablation_id),
-            "n_configs":         results["config"].n_unique(),
-            "friedman_p":        round(fp, 4),
-            "significant":       analysis["friedman"]["significant"],
+            "ablation_id":           ablation_id,
+            "component":             get_component_name(ablation_id),
+            "n_configs":             results["config"].n_unique(),
+            "friedman_p":            round(fp, 4),
+            "significant":           analysis["friedman"]["significant"],
+            # Seleção vs baseline por mean_diff (comparativo clássico das ablações marginais)
+            "best_config_vs_baseline": best_config,
+            "mean_diff_vs_baseline":   round(best_improvement, 4),
+            # Seleção direta argmax por métrica (alvo financeiro / W1)
+            "argmax_config":           argmax_config,
+            "argmax_metric_value":     (round(float(argmax_value), 4)
+                                        if argmax_value is not None
+                                        and np.isfinite(float(argmax_value)) else None),
+            # Aliases retrocompatíveis: apontam para a semântica clássica (vs baseline).
+            # Em W1 ou análises sem baseline canônico, prefira 'argmax_config'/'argmax_metric_value'.
             "best_config":       best_config,
             "best_improvement":  round(best_improvement, 4),
-            "variance_explained": round(ve, 4),
-            "max_effect_size":   round(max_d, 3),
+            "variance_explained":    round(ve, 4),
+            "max_effect_size":       round(max_d, 3),
         })
 
     df = pl.DataFrame(impact_rows)

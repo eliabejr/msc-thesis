@@ -3,13 +3,14 @@ ablation/jit_metrics.py
 ========================
 Métricas de performance compiladas com Numba JIT para máxima velocidade.
 
-Métricas implementadas:
-  - Sortino Ratio        (JIT)
-  - Maximum Drawdown     (JIT)
-  - Sharpe Ratio         (JIT)
-  - Average Detection Delay / ADD  (JIT)
-  - False Alarm Rate     (JIT)
-  - compute_metrics_array: wrapper que retorna dict com todas as métricas
+ Métricas implementadas:
+  - Sortino Ratio                (JIT)
+  - Maximum Drawdown             (JIT)
+  - Sharpe Ratio                 (JIT)
+  - Average Detection Delay / ADD(JIT)
+  - False Alarm Rate             (JIT)
+  - Miss Rate                    (JIT)
+  - compute_metrics_array        : wrapper que retorna dict com todas as métricas
 
 Uso:
   >>> import numpy as np
@@ -258,6 +259,59 @@ def false_alarm_rate_jit(
 
 
 # ---------------------------------------------------------------------------
+# JIT – Miss Rate
+# ---------------------------------------------------------------------------
+
+@nb.njit(cache=True, fastmath=True)
+def miss_rate_jit(
+    true_labels: np.ndarray,
+    pred_labels: np.ndarray,
+    max_delay:   int = 126,
+) -> float:
+    """
+    Taxa de mudanças reais não detectadas na janela de tolerância.
+
+    Para cada changepoint em ``true_labels`` no instante ``t``, a mudança é
+    considerada detectada se existir ``d`` em ``[0, max_delay)`` tal que
+    ``pred_labels[t + d] == true_labels[t]``. Caso contrário, conta como miss.
+
+    Parameters
+    ----------
+    true_labels : labels de referência (0 ou 1)
+    pred_labels : labels preditos
+    max_delay   : janela máxima para considerar uma detecção válida
+
+    Returns
+    -------
+    float : Miss Rate ∈ [0, 1]
+    """
+    T = len(true_labels)
+    if T != len(pred_labels) or T < 2:
+        return 0.0
+
+    misses = 0
+    n_changes = 0
+
+    for t in range(1, T):
+        if true_labels[t] != true_labels[t - 1]:
+            detected = False
+            for d in range(0, max_delay):
+                if t + d >= T:
+                    break
+                if pred_labels[t + d] == true_labels[t]:
+                    detected = True
+                    break
+            if not detected:
+                misses += 1
+            n_changes += 1
+
+    if n_changes == 0:
+        return 0.0
+
+    return float(misses) / float(n_changes)
+
+
+# ---------------------------------------------------------------------------
 # JIT – Calmar Ratio
 # ---------------------------------------------------------------------------
 
@@ -320,6 +374,58 @@ def annualized_turnover_jit(
 
 
 # ---------------------------------------------------------------------------
+# JIT – Stage 3 single-asset portfolio
+# ---------------------------------------------------------------------------
+
+@nb.njit(cache=True, fastmath=True)
+def simple_portfolio_jit(
+    pred_labels: np.ndarray,
+    er:          np.ndarray,
+    gamma_trade: float,
+    gamma_risk:  float,
+    leverage_max: float,
+    transaction_cost: float,
+) -> np.ndarray:
+    """
+    Implementa a regra single-asset do Stage 3 em Numba.
+
+    Semântica idêntica à versão Python:
+      - bull := 1 - pred_label
+      - pos := bull * risk_scale
+      - tc  := |Δpos| * transaction_cost * (1 + gamma_trade)
+      - ret := pos * er - tc
+    """
+    n = min(len(pred_labels), len(er))
+    port_ret = np.zeros(n, dtype=np.float64)
+    prev_pos = 0.0
+
+    baseline_gr = 10.0
+    if (not np.isfinite(gamma_risk)) or gamma_risk <= 0.0:
+        risk_scale = 1.0
+    else:
+        risk_scale = baseline_gr / gamma_risk
+
+    lev_cap = leverage_max
+    if lev_cap < 0.0 or not np.isfinite(lev_cap):
+        lev_cap = 0.0
+    if risk_scale < 0.0:
+        risk_scale = 0.0
+    elif risk_scale > lev_cap:
+        risk_scale = lev_cap
+
+    trade_penalty = transaction_cost * (1.0 + gamma_trade)
+
+    for t in range(n):
+        bull = 1.0 - pred_labels[t]
+        pos = bull * risk_scale
+        tc = abs(pos - prev_pos) * trade_penalty
+        port_ret[t] = pos * er[t] - tc
+        prev_pos = pos
+
+    return port_ret
+
+
+# ---------------------------------------------------------------------------
 # Wrapper Python: retorna dict de métricas
 # ---------------------------------------------------------------------------
 
@@ -343,7 +449,7 @@ def compute_metrics_array(
 
     Returns
     -------
-    dict com chaves: Sortino, Sharpe, MDD, Calmar, ADD, FAR
+    dict com chaves: Sortino, Sharpe, MDD, Calmar, ADD, FAR, MissRate
     """
     returns_arr = np.asarray(returns, dtype=np.float64)
 
@@ -359,5 +465,6 @@ def compute_metrics_array(
         pl_ = np.asarray(pred_labels, dtype=np.int64)
         metrics["ADD"] = float(compute_add_jit(tl, pl_))
         metrics["FAR"] = float(false_alarm_rate_jit(tl, pl_))
+        metrics["MissRate"] = float(miss_rate_jit(tl, pl_))
 
     return metrics
