@@ -39,8 +39,8 @@ After installing, open Docker Desktop and wait until it shows "Docker is running
 Open a terminal (Mac: `Terminal` app; Windows: `PowerShell` or `Command Prompt`) and run:
 
 ```bash
-git clone https://github.com/eliabejr/shu_et_al_2024.git
-cd shu_et_al_2024
+git clone https://github.com/eliabejr/msc-thesis.git
+cd msc-thesis
 ```
 
 If you do not have `git`, download the ZIP from the GitHub page and unzip it, then navigate to the folder in your terminal.
@@ -64,8 +64,8 @@ docker compose up notebooks
 You will see output ending with lines like:
 
 ```
-shu2024_notebooks  |     To access the server, open this URL in a browser:
-shu2024_notebooks  |         http://127.0.0.1:8888/lab
+eliabejr-msc-thesis_notebooks  |     To access the server, open this URL in a browser:
+eliabejr-msc-thesis_notebooks  |         http://127.0.0.1:8888/lab
 ```
 
 Open your browser and go to **http://localhost:8888**. You will see the Jupyter Lab interface.

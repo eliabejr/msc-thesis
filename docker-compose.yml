@@ -15,8 +15,8 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    image: shu2024:latest
-    container_name: shu2024_notebooks
+    image: eliabejr-msc-thesis:latest
+    container_name: eliabejr-msc-thesis_notebooks
     ports:
       - "8888:8888"
     volumes:
@@ -49,8 +49,8 @@ services:
 
   # ── Headless pipeline (full replication) ────────────────────────────────────
   pipeline:
-    image: shu2024:latest
-    container_name: shu2024_pipeline
+    image: eliabejr-msc-thesis:latest
+    container_name: eliabejr-msc-thesis_pipeline
     volumes:
       - ./data:/home/researcher/app/data
       - ./results:/home/researcher/app/results
@@ -63,8 +63,8 @@ services:
 
   # ── Smoke tests ─────────────────────────────────────────────────────────────
   tests:
-    image: shu2024:latest
-    container_name: shu2024_tests
+    image: eliabejr-msc-thesis:latest
+    container_name: eliabejr-msc-thesis_tests
     volumes:
       - ./src:/home/researcher/app/src
     environment:

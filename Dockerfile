@@ -27,8 +27,8 @@ RUN pip install --upgrade pip && \
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
 FROM python:3.11-slim AS runtime
 
-LABEL maintainer="MSc Thesis – Shu et al. 2024 replication"
-LABEL description="JM-XGB Dynamic Asset Allocation framework"
+LABEL maintainer="MSc Thesis – Eliabe Serafim Jr"
+LABEL description="ASJM - Adaptive Strategy for Jump Models in Asset Allocation"
 
 # Runtime system libraries (only what's needed to *run*, not compile)
 RUN apt-get update && apt-get install -y --no-install-recommends \
