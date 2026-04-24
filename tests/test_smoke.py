@@ -32,6 +32,87 @@ def test_model_imports():
     assert JumpModel is not None
 
 
+def test_regime_forecaster_one_class_fallback(monkeypatch):
+    from src.config.settings import XGB_PARAMS
+    from src.models.xgb_classifier import RegimeForecaster
+
+    idx = pd.date_range("2020-01-01", periods=10, freq="B")
+    X_train = pd.DataFrame(
+        {
+            "feat_1": np.linspace(0.0, 1.0, len(idx)),
+            "feat_2": np.linspace(1.0, 2.0, len(idx)),
+        },
+        index=idx,
+    )
+    y_train = pd.Series(1, index=idx, dtype=int)
+    X_pred = X_train.iloc[:4]
+
+    forecaster = RegimeForecaster(asset_name="LargeCap")
+
+    def _unexpected_fit(*args, **kwargs):
+        raise AssertionError("XGBoost fit should not run for one-class labels.")
+
+    monkeypatch.setattr(forecaster._clf, "fit", _unexpected_fit)
+    forecaster.fit(X_train, y_train)
+
+    proba = forecaster.predict_proba_series(X_pred)
+    regime = forecaster.predict_regime(X_pred)
+
+    assert "use_label_encoder" not in XGB_PARAMS
+    assert forecaster._constant_class == 1
+    assert np.allclose(proba.values, 1.0)
+    assert (regime.values == 1).all()
+
+
+def test_regime_framework_run_parallel_by_asset(monkeypatch):
+    from src.models.regime_framework import RegimeFramework
+
+    idx = pd.date_range("2020-01-01", periods=5, freq="B")
+    excess_returns = pd.DataFrame(
+        {
+            "AssetA": np.linspace(0.0, 0.004, len(idx)),
+            "AssetB": np.linspace(0.001, 0.005, len(idx)),
+        },
+        index=idx,
+    )
+    rf = pd.Series(0.0, index=idx)
+    fred = pd.DataFrame(
+        {
+            "y2": np.linspace(1.0, 1.1, len(idx)),
+            "y10": np.linspace(2.0, 2.1, len(idx)),
+            "vix": np.linspace(20.0, 21.0, len(idx)),
+        },
+        index=idx,
+    )
+    calls = []
+
+    def _fake_run_single_asset(self, asset, rebal, test_end):
+        calls.append(asset)
+        return (
+            asset,
+            {idx[0]: int(asset == "AssetB")},
+            {idx[0]: 10.0 if asset == "AssetA" else 20.0},
+        )
+
+    monkeypatch.setattr(RegimeFramework, "_run_single_asset", _fake_run_single_asset)
+
+    fw = RegimeFramework(
+        excess_returns=excess_returns,
+        rf=rf,
+        fred_aligned=fred,
+        assets=["AssetA", "AssetB"],
+        asset_jobs=2,
+    )
+    regime_df, opt_lams = fw.run(test_start="2020-01-01", test_end="2020-01-31")
+
+    assert set(calls) == {"AssetA", "AssetB"}
+    assert list(regime_df.columns) == ["AssetA", "AssetB"]
+    assert regime_df.loc[idx[0], "AssetA"] == 0
+    assert regime_df.loc[idx[0], "AssetB"] == 1
+    assert opt_lams["AssetA"].iloc[0] == pytest.approx(10.0)
+    assert opt_lams["AssetB"].iloc[0] == pytest.approx(20.0)
+
+
 def test_portfolio_imports():
     from src.portfolio.optimizer import MVOptimizer
     from src.portfolio.strategies import STRATEGY_REGISTRY
