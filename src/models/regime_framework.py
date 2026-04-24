@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
 from src.config.settings import (
     ASSETS,
@@ -138,6 +139,7 @@ class RegimeFramework:
     train_years:      int                    = TRAIN_YEARS
     val_years:        int                    = VAL_YEARS
     rebal_months:     Tuple[int, ...]        = tuple(REBAL_MONTHS)
+    asset_jobs:       int                    = 1
     transaction_cost: float                  = 5e-4
 
     # Built lazily
@@ -250,6 +252,82 @@ class RegimeFramework:
     # Algorithm 2 – Optimal λ selection + testing-period forecasts
     # ------------------------------------------------------------------
 
+    def _run_single_asset(
+        self,
+        asset: str,
+        rebal: pd.DatetimeIndex,
+        test_end: str,
+    ) -> Tuple[str, Dict[pd.Timestamp, int], Dict[pd.Timestamp, float]]:
+        logger.info("Processing asset: %s", asset)
+
+        asset_forecasts: Dict[pd.Timestamp, int] = {}
+        asset_lams: Dict[pd.Timestamp, float] = {}
+
+        for i, rebal_date in enumerate(rebal):
+            # Validation window: [rebal_date - val_years, rebal_date)
+            val_end   = rebal_date - pd.Timedelta(days=1)
+            val_start = rebal_date - pd.DateOffset(years=self.val_years)
+
+            # OOS block
+            if i + 1 < len(rebal):
+                block_end = rebal[i + 1] - pd.Timedelta(days=1)
+            else:
+                block_end = pd.Timestamp(test_end)
+            block_start = rebal_date
+
+            best_sr  = float("-inf")
+            best_lam = self.lambda_grid[0]
+
+            for lam in self.lambda_grid:
+                try:
+                    fc = self.generate_forecasts_fixed_lambda(
+                        lam       = lam,
+                        pred_start= str(val_start.date()),
+                        pred_end  = str(val_end.date()),
+                        asset     = asset,
+                    )
+                    er_val = self.excess_returns[asset].reindex(fc.index)
+                    rf_val = self.rf.reindex(fc.index).fillna(0.0)
+                    sr     = _sharpe_01_strategy(
+                        fc, er_val, rf_val, tc=self.transaction_cost
+                    )
+                    if math.isfinite(sr) and sr > best_sr:
+                        best_sr  = float(sr)
+                        best_lam = float(lam)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] λ tuning: λ=%s failed at rebal %s: %s",
+                        asset, lam, rebal_date.date(), exc,
+                    )
+                    continue
+
+            if not math.isfinite(best_sr):
+                logger.warning(
+                    "[%s] No finite validation Sharpe at rebal %s — keeping λ=%.3f",
+                    asset, rebal_date.date(), best_lam,
+                )
+
+            logger.info(
+                "  [%s] rebal=%s  best_λ=%.3f  val_SR=%.3f",
+                asset, rebal_date.date(), best_lam, best_sr,
+            )
+            asset_lams[rebal_date] = best_lam
+
+            # Generate OOS forecasts with optimal λ
+            try:
+                oos_fc = self.generate_forecasts_fixed_lambda(
+                    lam        = best_lam,
+                    pred_start = str(block_start.date()),
+                    pred_end   = str(block_end.date()),
+                    asset      = asset,
+                )
+                for dt, val in oos_fc.items():
+                    asset_forecasts[dt] = int(val)
+            except Exception as exc:
+                logger.warning("OOS forecast failed for %s at %s: %s", asset, rebal_date, exc)
+
+        return asset, asset_forecasts, asset_lams
+
     def run(
         self,
         test_start: str,
@@ -271,74 +349,25 @@ class RegimeFramework:
         idx     = self.excess_returns.index
         rebal   = _rebalance_dates(idx, test_start, test_end, self.rebal_months)
 
-        all_forecasts: Dict[str, Dict[pd.Timestamp, int]] = {a: {} for a in self.assets}
-        optimal_lams:  Dict[str, Dict[pd.Timestamp, float]] = {a: {} for a in self.assets}
+        n_jobs = max(1, min(len(self.assets), int(self.asset_jobs)))
+        if n_jobs > 1:
+            logger.info("Running schedule across assets with n_jobs=%s", n_jobs)
+            asset_results = Parallel(n_jobs=n_jobs, backend="threading")(
+                delayed(self._run_single_asset)(asset, rebal, test_end)
+                for asset in self.assets
+            )
+        else:
+            asset_results = [
+                self._run_single_asset(asset, rebal, test_end)
+                for asset in self.assets
+            ]
 
-        for a in self.assets:
-            logger.info("Processing asset: %s", a)
-
-            for i, rebal_date in enumerate(rebal):
-                # Validation window: [rebal_date - val_years, rebal_date)
-                val_end   = rebal_date - pd.Timedelta(days=1)
-                val_start = rebal_date - pd.DateOffset(years=self.val_years)
-
-                # OOS block
-                if i + 1 < len(rebal):
-                    block_end = rebal[i + 1] - pd.Timedelta(days=1)
-                else:
-                    block_end = pd.Timestamp(test_end)
-                block_start = rebal_date
-
-                best_sr  = float("-inf")
-                best_lam = self.lambda_grid[0]
-
-                for lam in self.lambda_grid:
-                    try:
-                        fc = self.generate_forecasts_fixed_lambda(
-                            lam       = lam,
-                            pred_start= str(val_start.date()),
-                            pred_end  = str(val_end.date()),
-                            asset     = a,
-                        )
-                        er_val = self.excess_returns[a].reindex(fc.index)
-                        rf_val = self.rf.reindex(fc.index).fillna(0.0)
-                        sr     = _sharpe_01_strategy(
-                            fc, er_val, rf_val, tc=self.transaction_cost
-                        )
-                        if math.isfinite(sr) and sr > best_sr:
-                            best_sr  = float(sr)
-                            best_lam = float(lam)
-                    except Exception as exc:
-                        logger.warning(
-                            "[%s] λ tuning: λ=%s failed at rebal %s: %s",
-                            a, lam, rebal_date.date(), exc,
-                        )
-                        continue
-
-                if not math.isfinite(best_sr):
-                    logger.warning(
-                        "[%s] No finite validation Sharpe at rebal %s — keeping λ=%.3f",
-                        a, rebal_date.date(), best_lam,
-                    )
-
-                logger.info(
-                    "  [%s] rebal=%s  best_λ=%.3f  val_SR=%.3f",
-                    a, rebal_date.date(), best_lam, best_sr,
-                )
-                optimal_lams[a][rebal_date] = best_lam
-
-                # Generate OOS forecasts with optimal λ
-                try:
-                    oos_fc = self.generate_forecasts_fixed_lambda(
-                        lam        = best_lam,
-                        pred_start = str(block_start.date()),
-                        pred_end   = str(block_end.date()),
-                        asset      = a,
-                    )
-                    for dt, val in oos_fc.items():
-                        all_forecasts[a][dt] = int(val)
-                except Exception as exc:
-                    logger.warning("OOS forecast failed for %s at %s: %s", a, rebal_date, exc)
+        all_forecasts: Dict[str, Dict[pd.Timestamp, int]] = {
+            asset: forecasts for asset, forecasts, _ in asset_results
+        }
+        optimal_lams:  Dict[str, Dict[pd.Timestamp, float]] = {
+            asset: lams for asset, _, lams in asset_results
+        }
 
         regime_df = pd.DataFrame(
             {a: pd.Series(all_forecasts[a]) for a in self.assets}

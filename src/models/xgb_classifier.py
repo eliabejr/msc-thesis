@@ -47,13 +47,13 @@ class RegimeForecaster:
         self.asset_name = asset_name
         self.smooth_hl  = smooth_hl if smooth_hl is not None else PROB_SMOOTH_HL.get(asset_name, 0)
         self.threshold  = threshold
+        self._constant_class: Optional[int] = None
 
         params = dict(xgb_params or XGB_PARAMS)
-        # Remove non-XGB keys silently
-        params.pop("random_state", None)
+        seed = int(params.pop("random_state", 42))
         self._clf = XGBClassifier(
-            **{k: v for k, v in XGB_PARAMS.items() if k != "random_state"},
-            seed=XGB_PARAMS.get("random_state", 42),
+            **params,
+            seed=seed,
         )
 
         self._fitted = False
@@ -83,12 +83,17 @@ class RegimeForecaster:
 
         # Handle degenerate case (only one class in training)
         if len(np.unique(y)) < 2:
+            self._constant_class = int(y[0])
             logger.warning(
                 "[%s] Only one class in training labels. "
-                "Forecaster will predict the majority class.",
+                "Using constant %s forecast.",
                 self.asset_name,
+                "bearish" if self._constant_class == 1 else "bullish",
             )
+            self._fitted = True
+            return self
 
+        self._constant_class = None
         self._clf.fit(X, y)
         self._fitted = True
         return self
@@ -111,7 +116,10 @@ class RegimeForecaster:
         if not self._fitted:
             raise RuntimeError("Call fit() before predict_proba_series().")
 
-        raw_proba = self._clf.predict_proba(X.values)[:, 1]   # P(bearish)
+        if self._constant_class is not None:
+            raw_proba = np.full(len(X), float(self._constant_class), dtype=float)
+        else:
+            raw_proba = self._clf.predict_proba(X.values)[:, 1]   # P(bearish)
         proba_s   = pd.Series(raw_proba, index=X.index, name=f"p_bear_{self.asset_name}")
 
         if self.smooth_hl and self.smooth_hl > 0:

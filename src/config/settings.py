@@ -116,7 +116,6 @@ XGB_PARAMS: Dict = {
     "learning_rate":   0.3,
     "subsample":       1.0,
     "colsample_bytree": 1.0,
-    "use_label_encoder": False,
     "eval_metric":     "logloss",
     "random_state":    42,
     "n_jobs":          -1,
