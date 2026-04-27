@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +38,7 @@ from src.config.settings import (
     TRADING_DAYS_YEAR,
     TRAIN_YEARS,
     VAL_YEARS,
+    XGB_PARAMS,
 )
 from src.features.macro_features import MacroFeatureBuilder
 from src.features.return_features import ReturnFeatureBuilder
@@ -141,14 +144,60 @@ class RegimeFramework:
     rebal_months:     Tuple[int, ...]        = tuple(REBAL_MONTHS)
     asset_jobs:       int                    = 1
     transaction_cost: float                  = 5e-4
+    xgb_n_jobs:       int                    = 1
 
     # Built lazily
     _ret_feat_builder:   ReturnFeatureBuilder   = field(init=False, repr=False)
     _macro_feat_builder: MacroFeatureBuilder     = field(init=False, repr=False)
+    _macro_features:     Optional[pd.DataFrame]  = field(default=None, init=False, repr=False)
+    _asset_features:     Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         self._ret_feat_builder   = ReturnFeatureBuilder()
         self._macro_feat_builder = MacroFeatureBuilder()
+
+    def _get_macro_features(self) -> pd.DataFrame:
+        if self._macro_features is None:
+            self._macro_features = self._macro_feat_builder.build(
+                self.fred_aligned, self.excess_returns
+            )
+        return self._macro_features
+
+    def _get_asset_features(self, asset: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        cached = self._asset_features.get(asset)
+        if cached is not None:
+            return cached
+
+        macro_feats = self._get_macro_features()
+        ret_feats_xgb = self._ret_feat_builder.build(
+            self.excess_returns[asset], asset, for_jm=False
+        )
+        ret_feats_jm = self._ret_feat_builder.build(
+            self.excess_returns[asset], asset, for_jm=True
+        )
+        X_xgb_full = ret_feats_xgb.join(macro_feats, how="left").ffill()
+        cached = (X_xgb_full, ret_feats_jm)
+        self._asset_features[asset] = cached
+        return cached
+
+    @staticmethod
+    def _asset_cache_path(cache_dir: Path, cache_prefix: str, asset: str) -> Path:
+        safe_asset = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in asset)
+        return cache_dir / f"{cache_prefix}_{safe_asset}.pkl"
+
+    @staticmethod
+    def _load_asset_result(path: Path) -> Tuple[str, Dict[pd.Timestamp, int], Dict[pd.Timestamp, float]]:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    @staticmethod
+    def _save_asset_result(path: Path, payload: Tuple[str, Dict[pd.Timestamp, int], Dict[pd.Timestamp, float]]) -> None:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp_path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(path)
 
     # ------------------------------------------------------------------
     # Algorithm 1 – Regime forecasts for a fixed λ
@@ -181,15 +230,10 @@ class RegimeFramework:
         rebal = _rebalance_dates(idx, pred_start, pred_end, self.rebal_months)
         forecasts: Dict[pd.Timestamp, int] = {}
 
-        # Pre-compute full feature matrices once (expensive but reusable)
-        macro_feats = self._macro_feat_builder.build(self.fred_aligned, self.excess_returns)
-        ret_feats_xgb = self._ret_feat_builder.build(
-            self.excess_returns[asset], asset, for_jm=False
-        )
-        ret_feats_jm  = self._ret_feat_builder.build(
-            self.excess_returns[asset], asset, for_jm=True
-        )
-        X_xgb_full = ret_feats_xgb.join(macro_feats, how="left").ffill()
+        # Pre-compute full feature matrices once per framework/asset. Algorithm 2
+        # calls this method many times while scanning lambdas and validation
+        # windows, so rebuilding features here dominates runtime and memory churn.
+        X_xgb_full, ret_feats_jm = self._get_asset_features(asset)
 
         for i, rebal_date in enumerate(rebal):
             # Training window: [rebal_date - train_years, rebal_date)
@@ -232,7 +276,9 @@ class RegimeFramework:
             if valid_mask.sum() < 50:
                 continue
 
-            forecaster = RegimeForecaster(asset_name=asset)
+            xgb_params = dict(XGB_PARAMS)
+            xgb_params["n_jobs"] = self.xgb_n_jobs
+            forecaster = RegimeForecaster(asset_name=asset, xgb_params=xgb_params)
             forecaster.fit(
                 X_xgb_train.loc[valid_mask],
                 label_s.loc[valid_mask],
@@ -258,7 +304,14 @@ class RegimeFramework:
         rebal: pd.DatetimeIndex,
         test_end: str,
     ) -> Tuple[str, Dict[pd.Timestamp, int], Dict[pd.Timestamp, float]]:
-        logger.info("Processing asset: %s", asset)
+        logger.info(
+            "event=asset_start asset=%s rebalances=%d lambda_candidates=%d "
+            "xgb_n_jobs=%d",
+            asset,
+            len(rebal),
+            len(self.lambda_grid),
+            self.xgb_n_jobs,
+        )
 
         asset_forecasts: Dict[pd.Timestamp, int] = {}
         asset_lams: Dict[pd.Timestamp, float] = {}
@@ -274,6 +327,20 @@ class RegimeFramework:
             else:
                 block_end = pd.Timestamp(test_end)
             block_start = rebal_date
+
+            logger.info(
+                "event=asset_rebalance_start asset=%s rebalance=%s "
+                "rebalance_idx=%d rebalances=%d validation_start=%s "
+                "validation_end=%s block_start=%s block_end=%s",
+                asset,
+                rebal_date.date(),
+                i + 1,
+                len(rebal),
+                val_start.date(),
+                val_end.date(),
+                block_start.date(),
+                block_end.date(),
+            )
 
             best_sr  = float("-inf")
             best_lam = self.lambda_grid[0]
@@ -308,8 +375,12 @@ class RegimeFramework:
                 )
 
             logger.info(
-                "  [%s] rebal=%s  best_λ=%.3f  val_SR=%.3f",
-                asset, rebal_date.date(), best_lam, best_sr,
+                "event=asset_rebalance_done asset=%s rebalance=%s "
+                "best_lambda=%.6g validation_sharpe=%.6g",
+                asset,
+                rebal_date.date(),
+                best_lam,
+                best_sr,
             )
             asset_lams[rebal_date] = best_lam
 
@@ -326,12 +397,20 @@ class RegimeFramework:
             except Exception as exc:
                 logger.warning("OOS forecast failed for %s at %s: %s", asset, rebal_date, exc)
 
+        logger.info(
+            "event=asset_done asset=%s forecast_days=%d lambda_points=%d",
+            asset,
+            len(asset_forecasts),
+            len(asset_lams),
+        )
         return asset, asset_forecasts, asset_lams
 
     def run(
         self,
         test_start: str,
         test_end:   str,
+        asset_cache_dir: Optional[str | Path] = None,
+        cache_prefix: Optional[str] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
         """
         Algorithm 2: biannual λ tuning + out-of-sample forecast generation.
@@ -349,16 +428,66 @@ class RegimeFramework:
         idx     = self.excess_returns.index
         rebal   = _rebalance_dates(idx, test_start, test_end, self.rebal_months)
 
+        cache_dir_path = Path(asset_cache_dir) if asset_cache_dir is not None else None
+        if cache_dir_path is not None:
+            cache_dir_path.mkdir(parents=True, exist_ok=True)
+        prefix = cache_prefix or (
+            "regime_" + "_".join(str(m) for m in self.rebal_months)
+        )
+        if cache_dir_path is not None:
+            existing = [
+                asset for asset in self.assets
+                if self._asset_cache_path(cache_dir_path, prefix, asset).is_file()
+            ]
+            logger.info(
+                "event=asset_checkpoint_status prefix=%s cached_assets=%d "
+                "total_assets=%d cache_dir=%s",
+                prefix,
+                len(existing),
+                len(self.assets),
+                cache_dir_path,
+            )
+
+        def run_or_load(asset: str) -> Tuple[str, Dict[pd.Timestamp, int], Dict[pd.Timestamp, float]]:
+            if cache_dir_path is None:
+                return self._run_single_asset(asset, rebal, test_end)
+
+            path = self._asset_cache_path(cache_dir_path, prefix, asset)
+            if path.is_file():
+                logger.info(
+                    "event=asset_checkpoint_load asset=%s path=%s",
+                    asset,
+                    path,
+                )
+                return self._load_asset_result(path)
+
+            result = self._run_single_asset(asset, rebal, test_end)
+            self._save_asset_result(path, result)
+            logger.info(
+                "event=asset_checkpoint_save asset=%s path=%s",
+                asset,
+                path,
+            )
+            return result
+
         n_jobs = max(1, min(len(self.assets), int(self.asset_jobs)))
+        logger.info(
+            "event=framework_run_start assets=%d rebalances=%d asset_jobs=%d "
+            "xgb_n_jobs=%d prefix=%s",
+            len(self.assets),
+            len(rebal),
+            n_jobs,
+            self.xgb_n_jobs,
+            prefix,
+        )
         if n_jobs > 1:
-            logger.info("Running schedule across assets with n_jobs=%s", n_jobs)
             asset_results = Parallel(n_jobs=n_jobs, backend="threading")(
-                delayed(self._run_single_asset)(asset, rebal, test_end)
+                delayed(run_or_load)(asset)
                 for asset in self.assets
             )
         else:
             asset_results = [
-                self._run_single_asset(asset, rebal, test_end)
+                run_or_load(asset)
                 for asset in self.assets
             ]
 
